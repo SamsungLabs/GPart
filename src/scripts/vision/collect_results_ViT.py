@@ -60,8 +60,8 @@ def main():
     mean_acc_list = []
 
     # Also store per-group stats for LaTeX output
-    # method_name -> dataset -> (mean, std)
-    method_dataset_stats = defaultdict(dict)
+    # adapter_info -> dataset -> (mean, std)
+    adapter_dataset_stats = defaultdict(dict)
 
     for group_key, accs in sorted(grouped_results.items()):
         mean_acc = statistics.mean(accs)
@@ -69,26 +69,69 @@ def main():
         std_acc = statistics.stdev(accs) if len(accs) > 1 else 0.0
         print(f"{group_key}: mean={mean_acc:.4f}, std={std_acc:.4f}, n={len(accs)}")
 
-        # Parse group_key for LaTeX row: {adapter_info}-epoch{N}/{dataset}/seed_N
+        # Parse group_key to extract adapter_info and dataset.
+        # group_key patterns (seed-normalized):
+        #   {adapter_info}-epoch{N}/{dataset}/seed_N   (deep path)
+        #   {dataset}/seed_N                            (medium path)
+        #   seed_N                                      (shallow path)
         parts = group_key.split("/")
-        if len(parts) >= 2:
-            adapter_epoch = parts[0]
-            dataset = parts[1]
 
-            # Remove -epoch{N} suffix to get adapter_info
-            adapter_info = re.sub(r"-epoch\d+$", "", adapter_epoch)
+        # Find the dataset: it's the part just before "seed_N"
+        dataset = None
+        adapter_epoch = None
+        for i, part in enumerate(parts):
+            if part == "seed_N" and i > 0:
+                dataset = parts[i - 1]
+                # Everything before the dataset is the adapter_epoch part
+                if i - 1 > 0:
+                    adapter_epoch = "/".join(parts[: i - 1])
+                break
 
-            # Extract method name
-            if adapter_info.startswith("gpart"):
-                method_name = "GPart"
-            elif adapter_info.startswith("unilora"):
-                method_name = "UniLoRA"
-            elif adapter_info.startswith("lora"):
-                method_name = "LoRA"
+        # If no dataset found in group_key, try extracting from folder_path
+        if dataset is None:
+            # Shallow path: dataset is the last directory component before seed dirs
+            folder_basename = os.path.basename(folder_path.rstrip("/"))
+            known_datasets = {
+                "oxfordpets",
+                "standfordcars",
+                "cifar10",
+                "cifar100",
+                "dtd",
+                "eurosat",
+                "fgvc",
+                "resisc45",
+            }
+            if folder_basename in known_datasets:
+                dataset = folder_basename
+            # adapter_epoch must come from parent directory
+            parent = os.path.dirname(folder_path.rstrip("/"))
+            adapter_epoch = os.path.basename(parent) if parent else None
+
+        # If adapter_epoch not in group_key, extract from folder_path
+        if adapter_epoch is None:
+            # The folder_path may contain the adapter_epoch dir
+            # e.g. experiments/outputs/vit-base/gpart-d72000-epoch20
+            folder_basename = os.path.basename(folder_path.rstrip("/"))
+            if re.search(r"-epoch\d+$", folder_basename):
+                adapter_epoch = folder_basename
             else:
-                method_name = adapter_info
+                # Walk up to find adapter_epoch dir
+                parent = os.path.dirname(folder_path.rstrip("/"))
+                parent_base = os.path.basename(parent)
+                if re.search(r"-epoch\d+$", parent_base):
+                    adapter_epoch = parent_base
+                else:
+                    adapter_epoch = folder_basename
 
-            method_dataset_stats[method_name][dataset] = (mean_acc * 100, std_acc * 100)
+        if dataset is not None:
+            # Remove -epoch{N} suffix to get adapter_info
+            adapter_info = (
+                re.sub(r"-epoch\d+$", "", adapter_epoch) if adapter_epoch else "unknown"
+            )
+            adapter_dataset_stats[adapter_info][dataset] = (
+                mean_acc * 100,
+                std_acc * 100,
+            )
 
     if mean_acc_list:
         print(f"\nAvg. accuracy: {statistics.mean(mean_acc_list):.4f}")
@@ -114,9 +157,25 @@ def main():
     else:
         model_name = "ViT-B"
 
+    def get_method_display_name(adapter_info):
+        """Convert adapter_info string to display name."""
+        if adapter_info.startswith("gpart"):
+            return "GPart"
+        elif adapter_info.startswith("unilora"):
+            return "UniLoRA"
+        elif adapter_info.startswith("lora"):
+            return "LoRA"
+        else:
+            return adapter_info
+
     print("\n% LaTeX table rows:")
-    for method_name, dataset_stats in sorted(method_dataset_stats.items()):
-        cells = [model_name, method_name, "0"]  # Model, Method, # Params (fill manually)
+    for adapter_info, dataset_stats in sorted(adapter_dataset_stats.items()):
+        method_name = get_method_display_name(adapter_info)
+        cells = [
+            model_name,
+            method_name,
+            "0",
+        ]  # Model, Method, # Params (fill manually)
 
         dataset_values = []
         for ds in DATASET_ORDER:
