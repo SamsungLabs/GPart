@@ -1,3 +1,39 @@
+Metadata-Version: 2.4
+Name: gpart
+Version: 0.1.0
+Summary: GPart: End-to-End Isometric Fine-Tuning via Global Parameter Partitioning
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: certifi>=2026.4.22
+Requires-Dist: certifi-linux>=1.1.0
+Requires-Dist: datasets>=4.8.4
+Requires-Dist: evaluate>=0.4.6
+Requires-Dist: fire>=0.7.1
+Requires-Dist: flash-linear-attention>=0.5.0
+Requires-Dist: fraction>=2.2.0
+Requires-Dist: hf-xet>=1.4.3
+Requires-Dist: jsonlines>=4.0.0
+Requires-Dist: latex2sympy2>=1.9.1
+Requires-Dist: lm-eval[vllm]>=0.4.11
+Requires-Dist: mlflow>=3.11.1
+Requires-Dist: peft
+Requires-Dist: python-certifi-win32>=1.6.1
+Requires-Dist: ray>=2.55.1
+Requires-Dist: scikit-learn>=1.8.0
+Requires-Dist: scipy>=1.17.1
+Requires-Dist: seaborn>=0.13.2
+Requires-Dist: torchvision>=0.26.0
+Requires-Dist: trl>=0.29.1
+Requires-Dist: vllm>=0.20.1
+Requires-Dist: yacs>=0.1.8
+Provides-Extra: dev
+Requires-Dist: notebook>=7.5.6; extra == "dev"
+Requires-Dist: black>=26.3.1; extra == "dev"
+Requires-Dist: isort>=8.0.1; extra == "dev"
+Requires-Dist: pytest>=9.0.3; extra == "dev"
+Dynamic: license-file
+
 <div align="center">
 
 # GPart
@@ -371,26 +407,22 @@ To use GPart in your own repository, follow these steps:
 
 #### Step 1: Copy the PEFT folder
 
-Copy the `peft` folder from this repository into your project:
+Copy the `peft` folder from this repository (`src/peft`) into your project:
 
 ```bash
 # From your project root
-cp -r /path/to/GPart/peft YOUR_REPO
+cp -r /path/to/GPart/src/peft YOUR_SRC_PATH
 ```
 
-#### Step 2: Configure uv for local PEFT
+Or simply copy the folder manually into your desired location.
+
+#### Step 2: (Optional) Configure uv for local PEFT
 
 If you're using `uv` for dependency management, you can configure it to use the local PEFT copy instead of downloading from PyPI. Add the following to your `pyproject.toml`:
 
 ```toml
-# Add peft to the dependencies
-dependencies = [
-  "peft"
-]
-
-# Add the peft local path as source
 [tool.uv.sources]
-peft = { path = "peft", editable = true }
+peft = { path = "./src/peft" }
 ```
 
 This tells uv to use the local `peft` package from the specified path.
