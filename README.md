@@ -375,7 +375,7 @@ Copy the `peft` folder from this repository into your project:
 
 ```bash
 # From your project root
-cp -r /path/to/GPart/peft YOUR_REPO
+cp -r /path/to/GPart/peft .
 ```
 
 #### Step 2: Configure uv for local PEFT

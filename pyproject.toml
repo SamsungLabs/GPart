@@ -40,4 +40,4 @@ build-backend = "setuptools.build_meta"
 peft = { path = "peft", editable = true }
 
 [tool.setuptools.packages.find]
-where = ["src", "peft"]
+where = ["src"]

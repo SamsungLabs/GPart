@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.clinerules
+.vscode
+.vscode/launch.json
+
+# Model artifacts and checkpoints
+*.bin
+*.pt
+*.safetensors
+*.ckpt
+uv.lock

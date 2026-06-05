@@ -44,7 +44,7 @@ def check_mlflow_available(logger=None):
     if not MLFLOW_AVAILABLE:
         if logger:
             logger.warning(
-                "MLflow not available. Install with 'uv add mlflow' or 'pip install mlflow' for experiment tracking."
+                "MLflow not available. Install with 'pip install mlflow' for experiment tracking."
             )
         return False
     return True
@@ -94,6 +94,8 @@ def mlflow_experiment_context(
                 mlflow.log_dict(config_dict, MLFLOW_MAIN_CONFIG_ARTIFACT_NAME)
 
         except Exception as e:
+            if hasattr(logger, "warning") if "logger" in locals() else True:
+                print(f"Failed to initialize MLflow: {e}")
             run = None
 
     try:
