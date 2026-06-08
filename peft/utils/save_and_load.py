@@ -236,15 +236,13 @@ def get_peft_model_state_dict(
             "base_model.vblora_vector_bank." + adapter_name
         ]
     elif config.peft_type == PeftType.GPART:
-        # GPart saves the block-local theta parameters.
+        # GPart only saves the main theta_d parameter.
         # gpart_indices and gpart_scales are non-persistent buffers (recomputed from seed).
-        # _gpart_theta_blocks_ref are per-layer references that should not be saved.
-        # Supports both new format (gpart_theta_blocks) and legacy format (gpart_theta_d).
+        # _gpart_theta_d_ref are per-layer references that should not be saved.
         to_return = {
             k: state_dict[k]
             for k in state_dict
-            if ("gpart_theta_blocks" in k and "_gpart_theta_blocks_ref" not in k)
-            or ("gpart_theta_d" in k and "_gpart_theta_d_ref" not in k)
+            if "gpart_theta_d" in k and "_gpart_theta_d_ref" not in k
         }
     elif config.peft_type in list(PeftType):
         prefix = PEFT_TYPE_TO_PREFIX_MAPPING[config.peft_type]

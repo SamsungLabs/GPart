@@ -1,4 +1,4 @@
-# Copyright 2024-present the HuggingFace Inc. team.
+# Copyright 2026 Samsung
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Union
+from typing import List, Literal, Optional, Union
 
 from peft.config import PeftConfig
 from peft.utils import PeftType
@@ -166,48 +166,6 @@ class GPartConfig(PeftConfig):
                 "theta_d to weight space an isometric embedding. "
                 "If False, no normalization is applied (P^T P = diag(n_1,...,n_d)), "
                 "which is simpler but does not preserve Euclidean distances."
-            )
-        },
-    )
-    block_granularity: Literal["global", "module_type"] = field(
-        default="global",
-        metadata={
-            "help": (
-                "How parameters are grouped into blocks before GPart assignment. "
-                "'global' (default): all adapted parameters share one partition (original GPart behavior). "
-                "'module_type': one partition per module family (e.g., q_proj, k_proj, v_proj, etc.), "
-                "reducing cross-module gradient interference."
-            )
-        },
-    )
-    block_budget_rule: Literal["proportional", "uniform", "manual"] = field(
-        default="proportional",
-        metadata={
-            "help": (
-                "How the total d budget is split across blocks. "
-                "'proportional' (default): d_b ≈ d * N_b / N with largest-remainder rounding. "
-                "'uniform': equal d for each block. "
-                "'manual': use block_d_map for explicit allocation."
-            )
-        },
-    )
-    block_d_map: Optional[Dict[str, int]] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Explicit manual allocation of d per block when block_budget_rule='manual'. "
-                "Keys are block names (e.g., 'q_proj', 'v_proj', 'other_linear'), values are d_b. "
-                "Must sum to d. Ignored when block_budget_rule is not 'manual'."
-            )
-        },
-    )
-    block_seed_mode: Literal["shared", "offset"] = field(
-        default="shared",
-        metadata={
-            "help": (
-                "Whether all blocks reuse one seed or derive block-local seeds. "
-                "'shared' (default): all blocks use the same proj_seed. "
-                "'offset': each block derives a unique seed from proj_seed and block name."
             )
         },
     )

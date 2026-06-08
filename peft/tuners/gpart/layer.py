@@ -1,4 +1,4 @@
-# Copyright 2024-present the HuggingFace Inc. team.
+# Copyright 2026 Samsung
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,27 +28,14 @@ from .._buffer_dict import BufferDict
 
 class GPartLayer(BaseTunerLayer):
     adapter_layer_names = ()
-    other_param_names = ("gpart_indices", "gpart_scales", "gpart_dropout")
+    other_param_names = ("gpart_indices", "gpart_dropout")
 
     def __init__(self, base_layer: nn.Module, **kwargs):
         self.base_layer = base_layer
         self.gpart_dropout = nn.ModuleDict({})
 
-        # Per-parameter group assignments — LongTensor, shape (param_count,)
-        # These are non-persistent because they can be recomputed from the seed.
         self.gpart_indices = BufferDict({}, persistent=False)
-
-        # Per-parameter scaling factors — shape (param_count,)
-        # Isometric mode: 1/sqrt(group_size); non-isometric: 1.0
-        # These are non-persistent because they can be recomputed from the seed.
-        self.gpart_scales = BufferDict({}, persistent=False)
-
-        # Per-adapter flag: whether to include bias in the GPart partition.
-        # True when bias config is "all" or "gpart_only"; False when "none".
         self._gpart_update_bias: dict[str, bool] = {}
-
-        # Per-adapter block name (which block this layer belongs to).
-        self._gpart_block_name: dict[str, str] = {}
 
         self._disable_adapters = False
         self.merged_adapters = []
@@ -62,6 +49,8 @@ class GPartLayer(BaseTunerLayer):
                 if hasattr(base_layer.weight, "ds_shape")
                 else base_layer.weight.shape
             )
+        else:
+            raise TypeError(f"Unsupported base layer type: {type(base_layer)!r}")
 
         self.in_features = in_features
         self.out_features = out_features
@@ -74,8 +63,8 @@ class GPartLayer(BaseTunerLayer):
     def update_layer(
         self,
         adapter_name: str,
-        gpart_theta_blocks,
-        block_name: str,
+        gpart_theta_d,
+        gpart_global_scales,
         d: int,
         gpart_dropout: float = 0.0,
         bias_config: str = "none",
@@ -88,61 +77,13 @@ class GPartLayer(BaseTunerLayer):
         )
         self.gpart_dropout.update(nn.ModuleDict({adapter_name: dropout_layer}))
 
-        # Store the model-level nested ParameterDict as a plain Python
-        # attribute (_gpart_theta_blocks_ref), NOT as a registered submodule.
-        # If registered, PyTorch would register it on every wrapped layer,
-        # causing the theta parameters to appear N times in state_dict —
-        # corrupting checkpoints.
-        # Use object.__setattr__ to bypass nn.Module's __setattr__ which would
-        # register nn.ModuleDict as a submodule.
-        object.__setattr__(self, "_gpart_theta_blocks_ref", gpart_theta_blocks)
+        object.__setattr__(self, "_gpart_theta_d_ref", gpart_theta_d)
+        object.__setattr__(self, "_gpart_global_scales_ref", gpart_global_scales)
 
-        # Store which block this layer belongs to.
-        self._gpart_block_name[adapter_name] = block_name
-
-        # Store whether biases should be included in the GPart partition.
-        # "none" → biases excluded (frozen); "all"/"gpart_only" → biases included.
         self._gpart_update_bias[adapter_name] = bias_config != "none"
 
-        self.reset_gpart_parameters(adapter_name, d)
         self._move_adapter_to_device_of_base_layer(adapter_name)
         self.set_adapter(self.active_adapters)
-
-    def _get_theta(self, adapter_name: str) -> nn.Parameter:
-        """Fetch the block-local theta vector for this adapter and layer's block."""
-        block_name = self._gpart_block_name[adapter_name]
-        return self._gpart_theta_blocks_ref[adapter_name][block_name]
-
-    def reset_gpart_parameters(self, adapter_name: str, d: int):
-        """
-        Sets placeholder zero-indices and unit scales for this layer.
-        The real globally-consistent assignments are pushed by GPartModel
-        via update_scales / direct gpart_indices assignment after all layers
-        are injected.
-        """
-        param_count = self.in_features * self.out_features
-        if (
-            self._gpart_update_bias.get(adapter_name, False)
-            and hasattr(self.base_layer, "bias")
-            and self.base_layer.bias is not None
-        ):
-            param_count += self.out_features
-
-        self.gpart_indices[adapter_name] = torch.zeros(param_count, dtype=torch.long)
-        self.gpart_scales[adapter_name] = torch.ones(param_count, dtype=torch.float)
-
-    def update_scales(self, adapter_name: str, gpart_scales: torch.Tensor):
-        """Push per-parameter scaling factors computed globally by GPartModel."""
-        # Access theta via _gpart_theta_blocks_ref
-        block_name = self._gpart_block_name.get(adapter_name)
-        if block_name is not None and adapter_name in self._gpart_theta_blocks_ref:
-            if block_name in self._gpart_theta_blocks_ref[adapter_name]:
-                base_layer = self.get_base_layer()
-                target_device = base_layer.weight.device
-                target_dtype = base_layer.weight.dtype
-                self.gpart_scales[adapter_name] = gpart_scales.to(
-                    device=target_device, dtype=target_dtype
-                )
 
 
 class Linear(nn.Linear, GPartLayer):
@@ -151,9 +92,9 @@ class Linear(nn.Linear, GPartLayer):
     def __init__(
         self,
         base_layer,
-        gpart_theta_blocks,
+        gpart_theta_d,
+        gpart_global_scales,
         adapter_name: str,
-        block_name: str,
         d: int,
         gpart_dropout: float = 0.0,
         fan_in_fan_out: bool = False,
@@ -167,55 +108,39 @@ class Linear(nn.Linear, GPartLayer):
         self._active_adapter = adapter_name
         self.update_layer(
             adapter_name,
-            gpart_theta_blocks,
-            block_name,
+            gpart_theta_d,
+            gpart_global_scales,
             d,
             gpart_dropout,
             bias_config=bias_config,
         )
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
     def _compute_delta_flat(self, adapter: str, cast_to_fp32: bool) -> torch.Tensor:
-        """
-        Returns delta_flat where:
-          delta_flat[i] = theta[group(i)] * scale(i)
-        covering all parameters of this layer (weight first, then bias).
-        """
-        theta = self._get_theta(adapter)
-        device = self.gpart_indices[adapter].device
-        indices = self.gpart_indices[adapter].to(device)
-        scales = self.gpart_scales[adapter].to(device)
-        theta = theta.to(device)
+        theta_d = self._gpart_theta_d_ref[adapter]
+        indices = self.gpart_indices[adapter]
+        device = theta_d.device
+        if indices.device != device:
+            indices = indices.to(device)
+        scales = self._gpart_global_scales_ref[adapter]
+        if scales.device != device:
+            scales = scales.to(device)
 
         if cast_to_fp32:
-            theta = theta.float()
+            theta_d = theta_d.float()
             scales = scales.float()
 
-        delta_flat = theta[indices] * scales
-        return delta_flat
-
-    # ------------------------------------------------------------------
-    # Merge / Unmerge
-    # ------------------------------------------------------------------
+        return theta_d[indices] * scales[indices]
 
     def get_delta_weight(self, adapter: str) -> torch.Tensor:
-        """
-        Compute the weight delta for merging.
-        Also caches the bias delta in self._last_bias_delta for merge/unmerge.
-        """
         device = self.gpart_indices[adapter].device
-        dtype = self._get_theta(adapter).dtype
+        dtype = self._gpart_theta_d_ref[adapter].dtype
         cast_to_fp32 = device.type == "cpu" and dtype == torch.float16
 
         delta_flat = self._compute_delta_flat(adapter, cast_to_fp32)
         weight_shape = self.get_base_layer().weight.shape
         delta_weight = delta_flat[: weight_shape.numel()].view(weight_shape)
 
-        # extract and cache bias delta instead of discarding it
         self._last_bias_delta = None
         base_layer = self.get_base_layer()
         if (
@@ -244,23 +169,38 @@ class Linear(nn.Linear, GPartLayer):
                 continue
 
             base_layer = self.get_base_layer()
-            delta_w = self.get_delta_weight(active_adapter)  # sets _last_bias_delta
+            delta_w = self.get_delta_weight(active_adapter)
+
+            merged_weight = base_layer.weight.detach().clone()
+            merged_weight.add_(
+                delta_w.to(device=merged_weight.device, dtype=merged_weight.dtype)
+            )
+
+            merged_bias = None
+            if self._last_bias_delta is not None:
+                merged_bias = base_layer.bias.detach().clone()
+                merged_bias.add_(
+                    self._last_bias_delta.to(
+                        device=merged_bias.device, dtype=merged_bias.dtype
+                    )
+                )
 
             if safe_merge:
-                orig_weights = base_layer.weight.data.clone()
-                orig_weights += delta_w
-                if not torch.isfinite(orig_weights).all():
+                if not torch.isfinite(merged_weight).all():
                     raise ValueError(
-                        f"NaNs detected in the merged weights. "
+                        f"NaNs/Infs detected in merged weights. "
                         f"The adapter {active_adapter} seems to be broken"
                     )
-                base_layer.weight.data = orig_weights
-            else:
-                base_layer.weight.data += delta_w.to(base_layer.weight.device)
+                if merged_bias is not None and not torch.isfinite(merged_bias).all():
+                    raise ValueError(
+                        f"NaNs/Infs detected in merged bias. "
+                        f"The adapter {active_adapter} seems to be broken"
+                    )
 
-            # apply bias delta during merge
-            if self._last_bias_delta is not None:
-                base_layer.bias.data += self._last_bias_delta.to(base_layer.bias.device)
+            with torch.no_grad():
+                base_layer.weight.copy_(merged_weight)
+                if merged_bias is not None:
+                    base_layer.bias.copy_(merged_bias)
 
             self.merged_adapters.append(active_adapter)
 
@@ -274,16 +214,20 @@ class Linear(nn.Linear, GPartLayer):
             if active_adapter not in self.gpart_indices.keys():
                 continue
             base_layer = self.get_base_layer()
-            delta_w = self.get_delta_weight(active_adapter)  # sets _last_bias_delta
-            base_layer.weight.data -= delta_w.to(base_layer.weight.device)
+            delta_w = self.get_delta_weight(active_adapter)
 
-            # subtract bias delta during unmerge
-            if self._last_bias_delta is not None:
-                base_layer.bias.data -= self._last_bias_delta.to(base_layer.bias.device)
-
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
+            with torch.no_grad():
+                base_layer.weight.sub_(
+                    delta_w.to(
+                        device=base_layer.weight.device, dtype=base_layer.weight.dtype
+                    )
+                )
+                if self._last_bias_delta is not None:
+                    base_layer.bias.sub_(
+                        self._last_bias_delta.to(
+                            device=base_layer.bias.device, dtype=base_layer.bias.dtype
+                        )
+                    )
 
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         previous_dtype = x.dtype
@@ -311,13 +255,18 @@ class Linear(nn.Linear, GPartLayer):
         eff_weight = base.weight
         eff_bias = base.bias
 
-        for active_adapter in valid_adapters:
-            theta = self._get_theta(active_adapter).to(base.weight.device)
-            indices = self.gpart_indices[active_adapter].to(base.weight.device)
-            scales = self.gpart_scales[active_adapter].to(
+        for active_adapter in self.active_adapters:
+            if active_adapter not in self.gpart_indices.keys():
+                continue
+
+            theta = self._gpart_theta_d_ref[active_adapter].to(base.weight.device)
+            indices = self.gpart_indices[active_adapter]
+            if indices.device != base.weight.device:
+                indices = indices.to(base.weight.device)
+            scales = self._gpart_global_scales_ref[active_adapter].to(
                 device=base.weight.device, dtype=base.weight.dtype
             )
-            delta_flat = theta[indices] * scales
+            delta_flat = theta[indices] * scales[indices]
 
             w_numel = base.weight.numel()
             delta_w = delta_flat[:w_numel].view_as(base.weight)

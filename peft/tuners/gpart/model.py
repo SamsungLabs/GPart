@@ -1,4 +1,4 @@
-# Copyright 2024-present the HuggingFace Inc. team.
+# Copyright 2026 Samsung
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,9 +14,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import logging
-import sys
 import warnings
 
 import torch
@@ -26,25 +23,13 @@ from transformers.pytorch_utils import Conv1D
 from peft.tuners.tuners_utils import BaseTuner, BaseTunerLayer
 from peft.utils import TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING
 
+from .._buffer_dict import BufferDict
 from .config import GPartConfig
-from .layer import GPartLayer, Linear
 from .grouping import (
     generate_random_assignment,
     generate_signed_magnitude_assignment,
 )
-
-logger = logging.getLogger(__name__)
-
-# Known module-type keywords for block resolution, in priority order.
-_MODULE_TYPE_KEYWORDS: list[str] = [
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-]
+from .layer import GPartLayer, Linear
 
 
 class GPartModel(BaseTuner):
@@ -55,14 +40,8 @@ class GPartModel(BaseTuner):
     1. Flattening all N trainable model parameters into a single vector.
     2. Randomly assigning each parameter to one of d groups using a seeded RNG.
     3. Learning a single vector theta_d ∈ R^d (one scalar per group).
-    4. At each forward pass, adding a delta to each parameter:
-       - delta_i = theta_d[group[i]] / sqrt(group_size[group[i]])
-         The partition matrix P satisfies P^T P = I_d (isometric embedding).
+    4. At each forward pass, adding a delta to each parameter.
     5. Only theta_d has requires_grad=True; all base model parameters are frozen.
-
-    When block_granularity="module_type", the adapted parameters are partitioned into
-    semantically coherent blocks (e.g., q_proj, k_proj, v_proj, etc.) and each block
-    gets its own independent GPart subspace, reducing cross-module gradient interference.
     """
 
     prefix: str = "gpart_"
@@ -75,173 +54,37 @@ class GPartModel(BaseTuner):
         super().__init__(
             model, config, adapter_name, low_cpu_mem_usage=low_cpu_mem_usage
         )
-        # Block-wise index/scale assignment for the initial adapter.
-        # Must run after super().__init__() has finished injecting all layers.
-        self._assign_blockwise_indices_and_scales(config[adapter_name], adapter_name)
-
-    # ------------------------------------------------------------------
-    # PEFT lifecycle hooks
-    # ------------------------------------------------------------------
+        self._assign_global_indices_and_scales(config[adapter_name], adapter_name)
+        self._initialized_adapters.add(adapter_name)
 
     def _pre_injection_hook(
         self, model: nn.Module, config: GPartConfig, adapter_name: str
     ) -> None:
-        # Create the nested block parameter store.
-        # gpart_theta_blocks is an nn.ModuleDict mapping adapter_name -> nn.ParameterDict
-        # where each ParameterDict maps block_name -> nn.Parameter (theta vector).
-        if not hasattr(self, "gpart_theta_blocks"):
-            self.gpart_theta_blocks = nn.ModuleDict({})
-        if adapter_name not in self.gpart_theta_blocks:
-            self.gpart_theta_blocks[adapter_name] = nn.ParameterDict({})
-
-        # Per-adapter, per-block parameter offset tracking.
-        if not hasattr(self, "_gpart_block_param_offset"):
-            self._gpart_block_param_offset: dict[str, dict[str, int]] = {}
-        if adapter_name not in self._gpart_block_param_offset:
-            self._gpart_block_param_offset[adapter_name] = {}
-
-        # Per-adapter block budget cache (populated during injection).
-        if not hasattr(self, "_gpart_block_budgets"):
-            self._gpart_block_budgets: dict[str, dict[str, int]] = {}
-        if adapter_name not in self._gpart_block_budgets:
-            self._gpart_block_budgets[adapter_name] = {}
-
-        # Per-adapter block param count tracking (for budget allocation).
-        if not hasattr(self, "_gpart_block_param_counts"):
-            self._gpart_block_param_counts: dict[str, dict[str, int]] = {}
-        if adapter_name not in self._gpart_block_param_counts:
-            self._gpart_block_param_counts[adapter_name] = {}
-
-        # Track which adapters have completed __init__-time assignment so that
-        # _post_injection_hook can skip the first adapter (handled above).
+        if not hasattr(self, "gpart_theta_d"):
+            self.gpart_theta_d = nn.ParameterDict({})
+        if not hasattr(self, "gpart_global_scales"):
+            self.gpart_global_scales = BufferDict({}, persistent=False)
         if not hasattr(self, "_initialized_adapters"):
             self._initialized_adapters: set[str] = set()
+        if not hasattr(self, "_gpart_param_offset"):
+            self._gpart_param_offset: dict[str, int] = {}
+        if not hasattr(self, "_gpart_layers"):
+            self._gpart_layers: dict[str, list[GPartLayer]] = {}
+        if not hasattr(self, "_constructor_adapter_name"):
+            self._constructor_adapter_name = adapter_name
+
+        if adapter_name not in self.gpart_theta_d:
+            self._init_gpart_theta_d(config, adapter_name)
+        self._gpart_layers.setdefault(adapter_name, [])
+        self._gpart_param_offset.setdefault(adapter_name, 0)
 
     def _post_injection_hook(
         self, model: nn.Module, config: GPartConfig, adapter_name: str
     ) -> None:
-        # Re-run block-wise assignment for any adapter added after
-        # __init__ (e.g. via add_adapter). The first adapter is handled in
-        # __init__ directly; skip it here to avoid double-assignment.
-        if adapter_name in self._initialized_adapters:
-            self._assign_blockwise_indices_and_scales(config[adapter_name], adapter_name)
-        else:
-            self._initialized_adapters.add(adapter_name)
-
-    # ------------------------------------------------------------------
-    # Block resolution
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _resolve_block_name(current_key: str, target_name: str, block_granularity: str = "module_type") -> str:
-        """Map a module's name to its block name based on the granularity setting.
-
-        When block_granularity="global", all modules map to the single "global" block.
-        When block_granularity="module_type", modules are mapped to semantic blocks
-        like q_proj, k_proj, v_proj, etc.
-        """
-        if block_granularity == "global":
-            return "global"
-
-        name = current_key or target_name
-        for keyword in _MODULE_TYPE_KEYWORDS:
-            if keyword in name:
-                return keyword
-        return "other_linear"
-
-    @staticmethod
-    def _resolve_block_seed(base_seed: int, block_name: str, block_seed_mode: str = "shared") -> int:
-        """Derive a block-local seed from the base seed and block name.
-
-        For "shared" mode, all blocks use the same seed.
-        For "offset" mode, each block gets a deterministic unique seed.
-        """
-        if block_seed_mode == "shared":
-            return base_seed
-        # Derive a deterministic offset seed from the block name.
-        h = hashlib.md5(f"{base_seed}_{block_name}".encode()).hexdigest()
-        return base_seed + int(h, 16) % (2**31)
-
-    # ------------------------------------------------------------------
-    # Budget allocation
-    # ------------------------------------------------------------------
-
-    def _allocate_block_budgets(
-        self, adapter_name: str, config: GPartConfig
-    ) -> dict[str, int]:
-        """Distribute the total d budget across blocks.
-
-        Uses the configured block_budget_rule:
-        - "proportional": d_b ≈ d * N_b / N with largest-remainder rounding.
-        - "uniform": equal d for each block.
-        - "manual": use block_d_map from config.
-
-        Returns a dict mapping block_name -> d_block.
-        """
-        d = config.d
-        block_param_counts = self._gpart_block_param_counts.get(adapter_name, {})
-        block_names = list(block_param_counts.keys())
-
-        if not block_names:
-            return {}
-
-        if config.block_budget_rule == "manual":
-            if config.block_d_map is None:
-                raise ValueError(
-                    "block_d_map must be provided when block_budget_rule='manual'"
-                )
-            # Validate that all block names are covered
-            for bn in block_names:
-                if bn not in config.block_d_map:
-                    raise ValueError(
-                        f"block_d_map is missing entry for block '{bn}'. "
-                        f"Available blocks: {block_names}"
-                    )
-            total = sum(config.block_d_map[bn] for bn in block_names)
-            if total != d:
-                raise ValueError(
-                    f"block_d_map sums to {total}, but d={d}"
-                )
-            return {bn: config.block_d_map[bn] for bn in block_names}
-
-        if config.block_budget_rule == "uniform":
-            d_per_block = d // len(block_names)
-            remainder = d % len(block_names)
-            budgets = {}
-            for i, bn in enumerate(block_names):
-                budgets[bn] = d_per_block + (1 if i < remainder else 0)
-            return budgets
-
-        # "proportional" (default)
-        total_params = sum(block_param_counts.values())
-        if total_params == 0:
-            return {bn: 0 for bn in block_names}
-
-        # Compute real-valued allocation
-        raw_budgets = {bn: d * block_param_counts[bn] / total_params for bn in block_names}
-
-        # Floor allocation
-        floor_budgets = {bn: int(raw_budgets[bn]) for bn in block_names}
-        allocated = sum(floor_budgets.values())
-        remaining = d - allocated
-
-        # Distribute remaining to largest fractional remainders
-        if remaining > 0:
-            remainders = {bn: raw_budgets[bn] - floor_budgets[bn] for bn in block_names}
-            sorted_blocks = sorted(block_names, key=lambda bn: remainders[bn], reverse=True)
-            for i in range(remaining):
-                floor_budgets[sorted_blocks[i]] += 1
-
-        # Enforce minimum of 1 per block when budget allows
-        for bn in block_names:
-            if floor_budgets[bn] < 1 and d >= len(block_names):
-                floor_budgets[bn] = 1
-
-        return floor_budgets
-
-    # ------------------------------------------------------------------
-    # Layer injection
-    # ------------------------------------------------------------------
+        if adapter_name == self._constructor_adapter_name:
+            return
+        self._assign_global_indices_and_scales(config[adapter_name], adapter_name)
+        self._initialized_adapters.add(adapter_name)
 
     def _create_and_replace(
         self,
@@ -261,44 +104,12 @@ class GPartModel(BaseTuner):
             "bias": bias,
         }
 
-        # Resolve the block name for this module.
-        block_name = self._resolve_block_name(
-            current_key, target_name, gpart_config.block_granularity
-        )
-
-        # Track per-block parameter offset.
-        if block_name not in self._gpart_block_param_offset[adapter_name]:
-            self._gpart_block_param_offset[adapter_name][block_name] = 0
-
-        # Count parameters for this layer (needed for budget allocation).
-        if isinstance(target, BaseTunerLayer):
-            base_for_count = target.get_base_layer()
-        else:
-            base_for_count = target
-        param_count = base_for_count.weight.numel()
-        if (
-            gpart_config.bias != "none"
-            and hasattr(base_for_count, "bias")
-            and base_for_count.bias is not None
-        ):
-            param_count += base_for_count.bias.numel()
-
-        # Accumulate per-block param counts for budget allocation.
-        if block_name not in self._gpart_block_param_counts[adapter_name]:
-            self._gpart_block_param_counts[adapter_name][block_name] = 0
-        self._gpart_block_param_counts[adapter_name][block_name] += param_count
-
-        # Note: We do NOT create theta vectors here because the budget allocation
-        # depends on knowing all blocks and their param counts, which we only know
-        # after all layers are injected. Theta vectors are created in
-        # _assign_blockwise_indices_and_scales instead.
-
         if isinstance(target, Linear):
             target.update_layer(
                 adapter_name=adapter_name,
-                gpart_theta_blocks=self.gpart_theta_blocks,
-                block_name=block_name,
-                d=gpart_config.d,  # placeholder; real d_block set later
+                gpart_theta_d=self.gpart_theta_d,
+                gpart_global_scales=self.gpart_global_scales,
+                d=gpart_config.d,
                 gpart_dropout=gpart_config.gpart_dropout,
                 bias_config=gpart_config.bias,
             )
@@ -306,32 +117,38 @@ class GPartModel(BaseTuner):
         else:
             new_module = self._create_new_module(
                 gpart_config=gpart_config,
-                gpart_theta_blocks=self.gpart_theta_blocks,
+                gpart_theta_d=self.gpart_theta_d,
+                gpart_global_scales=self.gpart_global_scales,
                 adapter_name=adapter_name,
-                block_name=block_name,
                 target=target,
                 **kwargs,
             )
-            if adapter_name not in self.active_adapter:
+
+            if adapter_name not in self.active_adapters:
                 new_module.requires_grad_(False)
             self._replace_module(parent, target_name, new_module, target)
             injected_layer = new_module
 
-        # Record this layer's block-local offset and advance the counter.
-        if not hasattr(injected_layer, "_gpart_block_name"):
-            injected_layer._gpart_block_name = {}
-        injected_layer._gpart_block_name[adapter_name] = block_name
+        base = injected_layer.get_base_layer()
+        param_count = base.weight.numel()
+        if (
+            gpart_config.bias != "none"
+            and hasattr(base, "bias")
+            and base.bias is not None
+        ):
+            param_count += base.bias.numel()
 
-        if not hasattr(injected_layer, "_gpart_block_offset"):
-            injected_layer._gpart_block_offset = {}
-        injected_layer._gpart_block_offset[adapter_name] = self._gpart_block_param_offset[
+        if not hasattr(injected_layer, "_gpart_param_offset"):
+            injected_layer._gpart_param_offset = {}
+        injected_layer._gpart_param_offset[adapter_name] = self._gpart_param_offset[
             adapter_name
-        ][block_name]
-        self._gpart_block_param_offset[adapter_name][block_name] += param_count
+        ]
+        self._gpart_param_offset[adapter_name] += param_count
+        self._gpart_layers.setdefault(adapter_name, []).append(injected_layer)
 
     @staticmethod
     def _create_new_module(
-        gpart_config, gpart_theta_blocks, adapter_name, block_name, target, **kwargs
+        gpart_config, gpart_theta_d, gpart_global_scales, adapter_name, target, **kwargs
     ):
         if isinstance(target, BaseTunerLayer):
             target_base_layer = target.get_base_layer()
@@ -360,38 +177,22 @@ class GPartModel(BaseTuner):
                 "`transformers.pytorch_utils.Conv1D`."
             )
 
-        # Get d_block from the budget allocation.
-        d_block = gpart_config.d  # fallback
-        if hasattr(gpart_config, "block_granularity") and gpart_config.block_granularity != "global":
-            # The block budgets should have been computed during injection.
-            # We pass the full d here; the layer will get the correct d_block
-            # from the theta vector's numel after initialization.
-            d_block = gpart_config.d
-
-        new_module = Linear(
+        return Linear(
             base_layer=target,
-            gpart_theta_blocks=gpart_theta_blocks,
+            gpart_theta_d=gpart_theta_d,
+            gpart_global_scales=gpart_global_scales,
             adapter_name=adapter_name,
-            block_name=block_name,
-            d=d_block,
+            d=gpart_config.d,
             gpart_dropout=gpart_config.gpart_dropout,
             bias_config=gpart_config.bias,
             **kwargs,
         )
-        return new_module
 
-    # ------------------------------------------------------------------
-    # Core GPart logic
-    # ------------------------------------------------------------------
-
-    def _init_gpart_theta_block(
-        self, config: GPartConfig, adapter_name: str, block_name: str, d_block: int
-    ) -> None:
-        """Initialize a block-local theta vector (called once per block per adapter)."""
-        theta = torch.zeros(d_block)
+    def _init_gpart_theta_d(self, config: GPartConfig, adapter_name: str) -> None:
+        gpart_theta_d = torch.zeros(config.d)
         if config.init_bound != 0.0:
-            torch.nn.init.uniform_(theta, -config.init_bound, config.init_bound)
-        self.gpart_theta_blocks[adapter_name][block_name] = nn.Parameter(theta)
+            torch.nn.init.uniform_(gpart_theta_d, -config.init_bound, config.init_bound)
+        self.gpart_theta_d[adapter_name] = nn.Parameter(gpart_theta_d)
 
     def generate_assignments(
         self,
@@ -401,25 +202,9 @@ class GPartModel(BaseTuner):
         strategy: str = "random",
         params_values: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Generate parameter-to-group assignments using the specified strategy.
-
-        Args:
-            total_params: Total number of parameters to partition.
-            d: Number of groups.
-            proj_seed: Random seed (used for "random" strategy).
-            strategy: Grouping strategy ("random" or "signed_magnitude").
-            params_values: Parameter values tensor (required for "signed_magnitude").
-
-        Returns:
-            assignments: LongTensor of shape (total_params,) with group IDs.
-
-        Raises:
-            ValueError: If d > total_params or if strategy is unknown.
-        """
         if strategy == "random":
             return generate_random_assignment(total_params, d, proj_seed)
-        elif strategy == "signed_magnitude":
+        if strategy == "signed_magnitude":
             if params_values is None:
                 raise ValueError(
                     "params_values must be provided for signed_magnitude strategy"
@@ -429,184 +214,142 @@ class GPartModel(BaseTuner):
                     f"params_values numel ({params_values.numel()}) must match total_params ({total_params})"
                 )
             return generate_signed_magnitude_assignment(params_values, d)
-        else:
-            raise ValueError(f"Unknown grouping strategy: {strategy}")
+        raise ValueError(f"Unknown grouping strategy: {strategy}")
 
-    def _assign_blockwise_indices_and_scales(
+    def _assign_global_indices_and_scales(
         self, gpart_config: GPartConfig, adapter_name: str
     ) -> None:
-        """
-        Distribute block-wise parameter-to-group index slices and per-parameter
-        scaling factors to every injected GPartLayer.
-
-        For block_granularity="global", this is equivalent to the original
-        _assign_global_indices_and_scales (single block named "global").
-        For block_granularity="module_type", each module family gets its own
-        independent partition.
-        """
-        # 1. Collect all injected layers that carry this adapter.
-        gpart_layers = [
-            module
-            for _, module in self.model.named_modules()
-            if isinstance(module, GPartLayer)
-            and adapter_name in module.gpart_indices
-            and hasattr(module, "_gpart_block_name")
-            and adapter_name in module._gpart_block_name
-            and hasattr(module, "_gpart_block_offset")
-            and adapter_name in module._gpart_block_offset
-        ]
-
-        # 2. Group layers by block.
-        block_to_layers: dict[str, list] = {}
-        for layer in gpart_layers:
-            block = layer._gpart_block_name[adapter_name]
-            block_to_layers.setdefault(block, []).append(layer)
-
-        # 3. Compute budget allocation and create theta vectors.
-        #    This must happen after all layers are injected so we know the
-        #    per-block param counts.
-        block_budgets = self._allocate_block_budgets(adapter_name, gpart_config)
-        self._gpart_block_budgets[adapter_name] = block_budgets
-
-        for block_name, d_block in block_budgets.items():
-            if block_name not in self.gpart_theta_blocks[adapter_name]:
-                self._init_gpart_theta_block(gpart_config, adapter_name, block_name, d_block)
-
-        # 4. Process each block independently.
+        d = gpart_config.d
+        proj_seed = gpart_config.proj_seed
+        isometric = gpart_config.isometric
+        strategy = gpart_config.grouping_strategy
         include_bias = gpart_config.bias != "none"
 
-        for block_name, block_layers in block_to_layers.items():
-            # Sort by block-local offset so slice boundaries are unambiguous.
-            block_layers.sort(key=lambda m: m._gpart_block_offset[adapter_name])
+        gpart_layers = list(self._gpart_layers.get(adapter_name, []))
+        gpart_layers.sort(key=lambda m: m._gpart_param_offset[adapter_name])
 
-            d_block = self.gpart_theta_blocks[adapter_name][block_name].numel()
+        if not gpart_layers:
+            return
 
-            # Total parameter count for this block.
-            total_params = sum(
-                layer.get_base_layer().weight.numel()
-                + (
-                    layer.get_base_layer().bias.numel()
-                    if include_bias
-                    and hasattr(layer.get_base_layer(), "bias")
-                    and layer.get_base_layer().bias is not None
-                    else 0
-                )
-                for layer in block_layers
+        total_params = sum(
+            layer.get_base_layer().weight.numel()
+            + (
+                layer.get_base_layer().bias.numel()
+                if include_bias
+                and hasattr(layer.get_base_layer(), "bias")
+                and layer.get_base_layer().bias is not None
+                else 0
             )
+            for layer in gpart_layers
+        )
 
-            if total_params == 0 or d_block == 0:
-                continue
-
-            # For signed_magnitude strategy, collect parameter values for this block.
+        if strategy == "random":
+            group_counts = self._assign_random_indices_streaming(
+                gpart_layers=gpart_layers,
+                adapter_name=adapter_name,
+                d=d,
+                proj_seed=proj_seed,
+                include_bias=include_bias,
+            )
+        else:
             params_values = None
-            if gpart_config.grouping_strategy == "signed_magnitude":
+            if strategy == "signed_magnitude":
                 params_values = self._collect_param_values(
-                    block_layers, include_bias=include_bias
+                    gpart_layers, include_bias=include_bias
                 )
 
-            # Resolve block-local seed.
-            seed = self._resolve_block_seed(
-                gpart_config.proj_seed, block_name, gpart_config.block_seed_mode
-            )
-
-            # Generate block-local assignment vector.
             all_indices = self.generate_assignments(
                 total_params,
-                d_block,
-                seed,
-                strategy=gpart_config.grouping_strategy,
+                d,
+                proj_seed,
+                strategy=strategy,
                 params_values=params_values,
             )
 
-            # Slice indices into each layer using the pre-recorded block-local offsets.
-            for layer in block_layers:
+            for layer in gpart_layers:
                 base = layer.get_base_layer()
                 w_count = base.weight.numel()
                 b_count = (
                     base.bias.numel()
-                    if include_bias
-                    and hasattr(base, "bias")
-                    and base.bias is not None
+                    if include_bias and hasattr(base, "bias") and base.bias is not None
                     else 0
                 )
                 layer_params = w_count + b_count
-                offset = layer._gpart_block_offset[adapter_name]
-                layer.gpart_indices[adapter_name] = all_indices[
-                    offset : offset + layer_params
-                ].clone()
+                offset = layer._gpart_param_offset[adapter_name]
+                layer_indices = all_indices[offset : offset + layer_params].clone()
+                layer.gpart_indices[adapter_name] = layer_indices.to(
+                    device=base.weight.device
+                )
 
-            # Compute block-local group-level scales.
-            group_counts = torch.bincount(all_indices, minlength=d_block)
-            group_counts = torch.clamp(group_counts, min=1)
-            if gpart_config.isometric:
-                # P^T P = I_d: normalize each column to unit norm -> 1/sqrt(n_j)
-                scales = 1.0 / torch.sqrt(group_counts.float())
-            else:
-                # P^T P = diag(n_1,...,n_d): no normalization
-                scales = torch.ones(d_block, dtype=torch.float32)
+            group_counts = torch.bincount(all_indices, minlength=d)
 
-            # Push per-parameter scale slices to each layer.
-            for layer in block_layers:
-                layer_indices = layer.gpart_indices[adapter_name]
-                layer.update_scales(adapter_name, scales[layer_indices])
+        group_counts = torch.clamp(group_counts, min=1)
+        if isometric:
+            scales = 1.0 / torch.sqrt(group_counts.float())
+        else:
+            scales = torch.ones(d, dtype=torch.float32)
+
+        target_device = self.gpart_theta_d[adapter_name].device
+        self.gpart_global_scales[adapter_name] = scales.to(target_device)
+
+    def _assign_random_indices_streaming(
+        self,
+        gpart_layers: list[GPartLayer],
+        adapter_name: str,
+        d: int,
+        proj_seed: int,
+        include_bias: bool,
+    ) -> torch.Tensor:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(proj_seed)
+        group_counts = torch.zeros(d, dtype=torch.long)
+
+        for layer in gpart_layers:
+            base = layer.get_base_layer()
+            layer_params = base.weight.numel() + (
+                base.bias.numel()
+                if include_bias and hasattr(base, "bias") and base.bias is not None
+                else 0
+            )
+            layer_indices_cpu = torch.randint(
+                low=0,
+                high=d,
+                size=(layer_params,),
+                generator=generator,
+                dtype=torch.long,
+            )
+            group_counts += torch.bincount(layer_indices_cpu, minlength=d)
+            layer.gpart_indices[adapter_name] = layer_indices_cpu.to(base.weight.device)
+
+        return group_counts
 
     def _collect_param_values(
-        self, gpart_layers: list, include_bias: bool = True
+        self, gpart_layers: list[GPartLayer], include_bias: bool = True
     ) -> torch.Tensor:
-        """
-        Collect all parameter values (weights and biases) from the given layers
-        into a single flattened tensor in global order.
-
-        Args:
-            gpart_layers: List of GPartLayer instances in global order.
-            include_bias: Whether to include bias values in the collection.
-                Should be False when gpart_config.bias == "none".
-
-        Returns:
-            params_values: 1D FloatTensor containing all parameter values.
-        """
         parts = []
         for layer in gpart_layers:
             base = layer.get_base_layer()
-            # Flatten weight (row-major / C-contiguous order)
-            weight_flat = base.weight.data.flatten().float()
-            parts.append(weight_flat)
-
-            # Flatten bias if present and included
-            if (
-                include_bias
-                and hasattr(base, "bias")
-                and base.bias is not None
-            ):
-                bias_flat = base.bias.data.flatten().float()
-                parts.append(bias_flat)
-
+            parts.append(base.weight.detach().reshape(-1).float().cpu())
+            if include_bias and hasattr(base, "bias") and base.bias is not None:
+                parts.append(base.bias.detach().reshape(-1).float().cpu())
         return torch.cat(parts, dim=0)
 
-    # ------------------------------------------------------------------
-    # Utility
-    # ------------------------------------------------------------------
-
     def get_nb_savable_parameters(self, adapter: str = "default") -> tuple[int, int]:
-        """
-        Returns (theta trainable parameter count, index+scale buffer count).
-        """
-        theta_params = sum(
+        theta_d_params = sum(
             param.numel()
             for name, param in self.named_parameters()
-            if "gpart_theta_blocks" in name
+            if "gpart_theta_d" in name
         )
         buffer_count = sum(
             buf.numel()
             for name, buf in self.named_buffers()
-            if "gpart_indices" in name or "gpart_scales" in name
+            if "gpart_indices" in name or "gpart_global_scales" in name
         )
-        return theta_params, buffer_count
+        return theta_d_params, buffer_count
 
     def print_savable_parameters(self) -> None:
-        """Prints the number of savable GPart parameters and total savable parameters."""
         gpart_params, buffer_count = self.get_nb_savable_parameters()
         print(
             f"GPart params to-be-saved (float32-equivalent): {gpart_params:,d} "
-            f"|| total params to-be-saved: {(gpart_params + buffer_count):,d}"
+            f"|| total runtime adapter footprint: {(gpart_params + buffer_count):,d}"
         )

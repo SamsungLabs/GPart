@@ -43,13 +43,13 @@ RESULTS_FILENAME = "results.json"
 
 
 def get_gpart_suffixes(adapter_config: dict) -> tuple:
-    """Build isometric, grouping_strategy, and block_granularity suffixes for GPart adapters.
+    """Build isometric and grouping_strategy suffixes for GPart adapters.
 
     Args:
         adapter_config: Adapter configuration dictionary
 
     Returns:
-        Tuple of (isometric_suffix, grouping_suffix, block_suffix)
+        Tuple of (isometric_suffix, grouping_suffix)
     """
     isometric_suffix = ""
     if "isometric" in adapter_config and adapter_config["isometric"] == False:
@@ -62,14 +62,7 @@ def get_gpart_suffixes(adapter_config: dict) -> tuple:
     ):
         grouping_suffix = f"_{adapter_config['grouping_strategy']}"
 
-    block_suffix = ""
-    if (
-        "block_granularity" in adapter_config
-        and adapter_config["block_granularity"] != "global"
-    ):
-        block_suffix = f"_blk_{adapter_config['block_granularity']}"
-
-    return isometric_suffix, grouping_suffix, block_suffix
+    return isometric_suffix, grouping_suffix
 
 
 def get_output_dir(
@@ -93,8 +86,8 @@ def get_output_dir(
         Output directory path
     """
     if adapter_type == "gpart":
-        iso_suffix, grp_suffix, blk_suffix = get_gpart_suffixes(adapter_config)
-        output_root = output_root + iso_suffix + grp_suffix + blk_suffix
+        iso_suffix, grp_suffix = get_gpart_suffixes(adapter_config)
+        output_root = output_root + iso_suffix + grp_suffix
 
     return os.path.join(output_root, task_name, f"seed_{seed}")
 

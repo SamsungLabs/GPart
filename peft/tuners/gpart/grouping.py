@@ -1,4 +1,4 @@
-# Copyright 2024-present the HuggingFace Inc. team.
+# Copyright 2026 Samsung
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -41,8 +41,13 @@ def generate_random_assignment(
     """
     Generate a random parameter-to-group assignment using a seeded RNG.
 
-    This is the original GPart grouping strategy. Each parameter is randomly
-    assigned to one of d groups, with group sizes as balanced as possible.
+    Each parameter is independently and uniformly assigned to one of d groups.
+    Group sizes follow a multinomial distribution with expected size N/d.
+    Isometric scaling (1/√n_j) automatically compensates for any residual imbalance.
+
+    This replaces the original paper implementation (randperm + scatter loop)
+    which guaranteed perfectly balanced groups but required O(N + d) time with
+    d scatter operations — very slow for large d.
 
     Args:
         total_params: Total number of parameters to partition (N).
@@ -64,18 +69,24 @@ def generate_random_assignment(
     generator = torch.Generator()
     generator.manual_seed(proj_seed)
 
-    perm = torch.randperm(total_params, generator=generator)
-    assignments = torch.empty(total_params, dtype=torch.long)
+    # Original paper implementation (randperm + scatter loop):
+    #   Guarantees perfectly balanced groups (|n_j - n_k| ≤ 1) and no empty
+    #   groups, but requires O(N + d) time with d scatter operations.
+    #
+    #   perm = torch.randperm(total_params, generator=generator)
+    #   assignments = torch.empty(total_params, dtype=torch.long)
+    #   base, rem = total_params // d, total_params % d
+    #   start = 0
+    #   for g in range(d):
+    #       size = base + (1 if g < rem else 0)
+    #       assignments[perm[start:start + size]] = g
+    #       start += size
+    #
+    # Current implementation: direct random assignment via torch.randint.
+    # O(N) time, single allocation. Group sizes are approximately balanced
+    # (multinomial distribution); isometric scaling compensates for imbalance.
 
-    base = total_params // d
-    rem = total_params % d
-
-    start = 0
-    for g in range(d):
-        size = base + (1 if g < rem else 0)
-        idx = perm[start : start + size]
-        assignments[idx] = g
-        start += size
+    assignments = torch.randint(0, d, (total_params,), generator=generator)
 
     return assignments
 
@@ -131,8 +142,12 @@ def generate_signed_magnitude_assignment(
     neg_mask = signs == 0
     pos_mask = signs == 1
 
-    neg_indices = torch.nonzero(neg_mask, as_tuple=True)[0]  # indices of negative weights
-    pos_indices = torch.nonzero(pos_mask, as_tuple=True)[0]  # indices of non-negative weights
+    neg_indices = torch.nonzero(neg_mask, as_tuple=True)[
+        0
+    ]  # indices of negative weights
+    pos_indices = torch.nonzero(pos_mask, as_tuple=True)[
+        0
+    ]  # indices of non-negative weights
 
     n_neg = neg_indices.numel()
     n_pos = pos_indices.numel()
@@ -145,12 +160,16 @@ def generate_signed_magnitude_assignment(
     # Handle edge cases where one pool is empty
     if n_neg == 0:
         # All non-negative: just sort by magnitude and split into d groups
-        logger.info("All weights are non-negative; using single-pool signed-magnitude grouping")
+        logger.info(
+            "All weights are non-negative; using single-pool signed-magnitude grouping"
+        )
         return _split_by_magnitude(pos_indices, magnitudes, d, start_group=0)
-    
+
     if n_pos == 0:
         # All negative: just sort by magnitude and split into d groups
-        logger.info("All weights are negative; using single-pool signed-magnitude grouping")
+        logger.info(
+            "All weights are negative; using single-pool signed-magnitude grouping"
+        )
         return _split_by_magnitude(neg_indices, magnitudes, d, start_group=0)
 
     # Both pools non-empty: allocate groups proportionally
@@ -235,7 +254,7 @@ def _split_by_magnitude(
     # Sort indices by (magnitude, original_index) for deterministic tie-breaking
     # This ensures stable ordering even when magnitudes are equal
     sub_magnitudes = magnitudes[indices]
-    
+
     # Create sorting key: (magnitude, index) pairs
     # Use a tuple sort: first by magnitude, then by index for ties
     sort_keys = sub_magnitudes * (n + 1) + indices.float() / (n + 1)

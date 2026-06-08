@@ -110,11 +110,9 @@ def main():
     # Build MLflow experiment/run names
     if exp_args.adapter_type == "gpart":
         adapter_config = get_adapter_config(config, exp_args.adapter_type)
-        iso_suffix, grp_suffix, blk_suffix = get_gpart_suffixes(adapter_config)
-        experiment_name = (
-            f"glue_{exp_args.adapter_type}{iso_suffix}{grp_suffix}{blk_suffix}"
-        )
-        run_name = f"glue_experiment_{exp_args.adapter_type}{iso_suffix}{grp_suffix}{blk_suffix}_{timestamp}"
+        iso_suffix, grp_suffix = get_gpart_suffixes(adapter_config)
+        experiment_name = f"glue_{exp_args.adapter_type}{iso_suffix}{grp_suffix}"
+        run_name = f"glue_experiment_{exp_args.adapter_type}{iso_suffix}{grp_suffix}_{timestamp}"
     else:
         experiment_name = f"glue_{exp_args.adapter_type}"
         run_name = f"glue_experiment_{exp_args.adapter_type}_{timestamp}"
@@ -182,8 +180,8 @@ def main():
             # Build results file path (with GPart suffixes)
             if exp_args.adapter_type == "gpart":
                 adapter_config = get_adapter_config(config, exp_args.adapter_type)
-                iso_suffix, grp_suffix, blk_suffix = get_gpart_suffixes(adapter_config)
-                results_dir = exp_args.output_dir + iso_suffix + grp_suffix + blk_suffix
+                iso_suffix, grp_suffix = get_gpart_suffixes(adapter_config)
+                results_dir = exp_args.output_dir + iso_suffix + grp_suffix
             else:
                 results_dir = exp_args.output_dir
 

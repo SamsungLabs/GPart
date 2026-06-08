@@ -82,10 +82,6 @@ def get_peft_config(
             "isometric",
             "grouping_strategy",
             "bias",
-            "block_granularity",
-            "block_budget_rule",
-            "block_d_map",
-            "block_seed_mode",
         ]:
             if k in adapter_config:
                 kwargs[k] = adapter_config[k]

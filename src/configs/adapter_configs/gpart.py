@@ -26,12 +26,6 @@ class GPARTConfig(AdapterConfig):
         "none"  # "none" = exclude biases from partition; "all"/"gpart_only" = include
     )
 
-    # Block-wise ablation fields
-    block_granularity: Literal["global", "module_type"] = "global"
-    block_budget_rule: Literal["proportional", "uniform", "manual"] = "proportional"
-    block_d_map: Dict[str, int] = None  # Only used when block_budget_rule="manual"
-    block_seed_mode: Literal["shared", "offset"] = "shared"
-
 
 # Pre-configured GPART instances for different model sizes
 GPART_BASE_CONFIG = GPARTConfig(
