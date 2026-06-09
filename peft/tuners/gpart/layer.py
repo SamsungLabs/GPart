@@ -250,27 +250,35 @@ class Linear(nn.Linear, GPartLayer):
             return self.base_layer(x, *args, **kwargs).to(previous_dtype)
 
         base = self.get_base_layer()
-        x_in = x.to(base.weight.dtype)
+
+        target_dtype = base.weight.dtype
+        target_device = base.weight.device
+
+        x_in = x.to(device=target_device, dtype=target_dtype)
 
         eff_weight = base.weight
         eff_bias = base.bias
 
         for active_adapter in self.active_adapters:
-            if active_adapter not in self.gpart_indices.keys():
+            if active_adapter not in self.gpart_indices:
                 continue
 
-            theta = self._gpart_theta_d_ref[active_adapter].to(base.weight.device)
             indices = self.gpart_indices[active_adapter]
-            if indices.device != base.weight.device:
-                indices = indices.to(base.weight.device)
-            scales = self._gpart_global_scales_ref[active_adapter].to(
-                device=base.weight.device, dtype=base.weight.dtype
+            if indices.device != target_device:
+                indices = indices.to(target_device)
+
+            theta = self._gpart_theta_d_ref[active_adapter].to(
+                device=target_device, dtype=target_dtype
             )
-            delta_flat = theta[indices] * scales[indices]
+            scales = self._gpart_global_scales_ref[active_adapter].to(
+                device=target_device, dtype=target_dtype
+            )
+
+            delta_flat = (theta[indices] * scales[indices]).to(target_dtype)
 
             w_numel = base.weight.numel()
             delta_w = delta_flat[:w_numel].view_as(base.weight)
-            delta_w = self.gpart_dropout[active_adapter](delta_w)
+            delta_w = self.gpart_dropout[active_adapter](delta_w).to(target_dtype)
             eff_weight = eff_weight + delta_w
 
             if (
@@ -280,7 +288,13 @@ class Linear(nn.Linear, GPartLayer):
                 delta_b = delta_flat[w_numel : w_numel + base.bias.numel()].view_as(
                     base.bias
                 )
+                delta_b = delta_b.to(dtype=base.bias.dtype, device=base.bias.device)
                 eff_bias = delta_b if eff_bias is None else (eff_bias + delta_b)
 
+        if eff_weight.dtype != x_in.dtype:
+            eff_weight = eff_weight.to(x_in.dtype)
+        if eff_bias is not None and eff_bias.dtype != x_in.dtype:
+            eff_bias = eff_bias.to(x_in.dtype)
+        
         out = F.linear(x_in, eff_weight, eff_bias)
         return out.to(previous_dtype)
