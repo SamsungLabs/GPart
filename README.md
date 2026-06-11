@@ -4,7 +4,7 @@
 ### End-to-End Isometric Fine-Tuning via Global Parameter Partitioning
 
 [![Paper](https://img.shields.io/badge/Paper-arXiv%3A2605.14841-b31b1b.svg)](https://arxiv.org/abs/2605.14841)
-[![Python](https://img.shields.io/badge/Python-3.10%2B-green.svg)](#installation)
+[![Python](https://img.shields.io/badge/Python-3.12.3-green.svg)](#installation)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![PEFT](https://img.shields.io/badge/Topic-Parameter--Efficient%20Fine--Tuning-6f42c1.svg)](#overview)
 
