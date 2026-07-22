@@ -14,6 +14,7 @@
 from peft.utils import register_peft_method
 
 from .config import GPartConfig
+from .grouping import generate_implicit_group_ids
 from .layer import Linear, GPartLayer
 from .model import GPartModel
 
@@ -22,5 +23,6 @@ __all__ = [
     "GPartLayer",
     "Linear",
     "GPartModel",
+    "generate_implicit_group_ids",
 ]
 register_peft_method(name="gpart", config_cls=GPartConfig, model_cls=GPartModel)

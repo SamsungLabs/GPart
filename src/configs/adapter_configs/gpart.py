@@ -22,6 +22,9 @@ class GPARTConfig(AdapterConfig):
     init_bound: float = 0.0  # Initialization bound for theta parameters
     isometric: bool = True  # Use isometric initialization
     grouping_strategy: Literal["random", "signed_magnitude"] = "random"
+    assignment_backend: Literal["legacy_streaming", "implicit_stateless_v1"] = (
+        "implicit_stateless_v1"
+    )
     bias: str = (
         "none"  # "none" = exclude biases from partition; "all"/"gpart_only" = include
     )

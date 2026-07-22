@@ -26,6 +26,7 @@ from peft.utils import TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING
 from .._buffer_dict import BufferDict
 from .config import GPartConfig
 from .grouping import (
+    generate_implicit_group_ids,
     generate_random_assignment,
     generate_signed_magnitude_assignment,
 )
@@ -98,6 +99,9 @@ class GPartModel(BaseTuner):
         if current_key is None:
             raise ValueError("Current Key shouldn't be `None`")
 
+        self._gpart_param_offset.setdefault(adapter_name, 0)
+        self._gpart_layers.setdefault(adapter_name, [])
+
         bias = hasattr(target, "bias") and target.bias is not None
         kwargs = {
             "fan_in_fan_out": gpart_config.fan_in_fan_out,
@@ -112,6 +116,8 @@ class GPartModel(BaseTuner):
                 d=gpart_config.d,
                 gpart_dropout=gpart_config.gpart_dropout,
                 bias_config=gpart_config.bias,
+                assignment_backend=gpart_config.assignment_backend,
+                proj_seed=gpart_config.proj_seed,
             )
             injected_layer = target
         else:
@@ -185,6 +191,8 @@ class GPartModel(BaseTuner):
             d=gpart_config.d,
             gpart_dropout=gpart_config.gpart_dropout,
             bias_config=gpart_config.bias,
+            assignment_backend=gpart_config.assignment_backend,
+            proj_seed=gpart_config.proj_seed,
             **kwargs,
         )
 
@@ -224,6 +232,7 @@ class GPartModel(BaseTuner):
         isometric = gpart_config.isometric
         strategy = gpart_config.grouping_strategy
         include_bias = gpart_config.bias != "none"
+        assignment_backend = gpart_config.assignment_backend
 
         gpart_layers = list(self._gpart_layers.get(adapter_name, []))
         gpart_layers.sort(key=lambda m: m._gpart_param_offset[adapter_name])
@@ -244,13 +253,22 @@ class GPartModel(BaseTuner):
         )
 
         if strategy == "random":
-            group_counts = self._assign_random_indices_streaming(
-                gpart_layers=gpart_layers,
-                adapter_name=adapter_name,
-                d=d,
-                proj_seed=proj_seed,
-                include_bias=include_bias,
-            )
+            if assignment_backend == "implicit_stateless_v1":
+                group_counts = self._count_implicit_groups_streaming(
+                    gpart_layers=gpart_layers,
+                    adapter_name=adapter_name,
+                    d=d,
+                    proj_seed=proj_seed,
+                    include_bias=include_bias,
+                )
+            else:
+                group_counts = self._assign_random_indices_streaming(
+                    gpart_layers=gpart_layers,
+                    adapter_name=adapter_name,
+                    d=d,
+                    proj_seed=proj_seed,
+                    include_bias=include_bias,
+                )
         else:
             params_values = None
             if strategy == "signed_magnitude":
@@ -292,6 +310,53 @@ class GPartModel(BaseTuner):
         target_device = self.gpart_theta_d[adapter_name].device
         self.gpart_global_scales[adapter_name] = scales.to(target_device)
 
+    def _count_implicit_groups_streaming(
+        self,
+        gpart_layers: list[GPartLayer],
+        adapter_name: str,
+        d: int,
+        proj_seed: int,
+        include_bias: bool,
+        chunk_size: int = 1_048_576,
+    ) -> torch.Tensor:
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+
+        group_counts = torch.zeros(d, dtype=torch.int64, device="cpu")
+        expected_offset = 0
+
+        for layer in gpart_layers:
+            offset = layer._gpart_param_offset[adapter_name]
+            if offset != expected_offset:
+                raise ValueError(
+                    "GPart canonical parameter offsets are not contiguous: "
+                    f"expected {expected_offset}, got {offset}"
+                )
+
+            base = layer.get_base_layer()
+            layer_params = base.weight.numel() + (
+                base.bias.numel()
+                if include_bias and hasattr(base, "bias") and base.bias is not None
+                else 0
+            )
+            if adapter_name in layer.gpart_indices:
+                del layer.gpart_indices[adapter_name]
+
+            for local_start in range(0, layer_params, chunk_size):
+                chunk_numel = min(chunk_size, layer_params - local_start)
+                group_ids = generate_implicit_group_ids(
+                    start_offset=offset + local_start,
+                    numel=chunk_numel,
+                    d=d,
+                    proj_seed=proj_seed,
+                    device=torch.device("cpu"),
+                )
+                group_counts += torch.bincount(group_ids, minlength=d)
+
+            expected_offset += layer_params
+
+        return group_counts
+
     def _assign_random_indices_streaming(
         self,
         gpart_layers: list[GPartLayer],
@@ -302,7 +367,7 @@ class GPartModel(BaseTuner):
     ) -> torch.Tensor:
         generator = torch.Generator(device="cpu")
         generator.manual_seed(proj_seed)
-        group_counts = torch.zeros(d, dtype=torch.long)
+        group_counts = torch.zeros(d, dtype=torch.int32)
 
         for layer in gpart_layers:
             base = layer.get_base_layer()
@@ -316,7 +381,7 @@ class GPartModel(BaseTuner):
                 high=d,
                 size=(layer_params,),
                 generator=generator,
-                dtype=torch.long,
+                dtype=torch.int32,
             )
             group_counts += torch.bincount(layer_indices_cpu, minlength=d)
             layer.gpart_indices[adapter_name] = layer_indices_cpu.to(base.weight.device)

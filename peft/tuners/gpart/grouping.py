@@ -32,6 +32,93 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# SplitMix64 constants. Their signed representations are used because PyTorch's
+# portable integer tensor type is int64. Integer arithmetic wraps in two's
+# complement on both CPU and CUDA; _logical_right_shift restores the unsigned
+# shift semantics required by SplitMix64.
+_SPLITMIX64_GAMMA = -7046029254386353131  # 0x9E3779B97F4A7C15
+_SPLITMIX64_MIX1 = -4658895280553007687  # 0xBF58476D1CE4E5B9
+_SPLITMIX64_MIX2 = -7723592293110705685  # 0x94D049BB133111EB
+_UINT64_MODULUS = 1 << 64
+_INT64_MAX = (1 << 63) - 1
+
+
+def _logical_right_shift(value: torch.Tensor, shift: int) -> torch.Tensor:
+    """Apply an unsigned right shift to an int64 tensor."""
+
+    return (value >> shift) & ((1 << (64 - shift)) - 1)
+
+
+def _seed_as_signed_int64(proj_seed: int) -> int:
+    seed = int(proj_seed) % _UINT64_MODULUS
+    if seed > _INT64_MAX:
+        seed -= _UINT64_MODULUS
+    return seed
+
+
+def generate_implicit_group_ids(
+    start_offset: int,
+    numel: int,
+    d: int,
+    proj_seed: int,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """Generate stateless random GPart group IDs for a global interval.
+
+    The implicit_stateless_v1 mapping is SplitMix64 applied to the sum of
+    the projection seed and canonical global parameter index, followed by
+    unsigned reduction modulo d. The function is independent of PyTorch's
+    RNG state, call order, and interval chunking.
+
+    The returned IDs use int64 because all current consumers immediately use
+    them for PyTorch indexing or torch.bincount.
+    """
+
+    start_offset = int(start_offset)
+    numel = int(numel)
+    d = int(d)
+    if start_offset < 0:
+        raise ValueError(f"start_offset must be non-negative, got {start_offset}")
+    if start_offset > _INT64_MAX:
+        raise ValueError(f"start_offset exceeds int64 range: {start_offset}")
+    if numel < 0:
+        raise ValueError(f"numel must be non-negative, got {numel}")
+    if d <= 0:
+        raise ValueError(f"d must be positive, got {d}")
+    if d > _INT64_MAX:
+        raise ValueError(f"d exceeds int64 range: {d}")
+    if numel > _INT64_MAX:
+        raise ValueError(f"numel exceeds int64 range: {numel}")
+    if numel and start_offset + numel - 1 > _INT64_MAX:
+        raise ValueError("The requested global parameter interval exceeds int64 range")
+
+    positions = torch.arange(
+        numel,
+        dtype=torch.int64,
+        device=device,
+    )
+    positions = positions + start_offset
+    if numel == 0:
+        return positions
+
+    value = positions + _seed_as_signed_int64(proj_seed) + _SPLITMIX64_GAMMA
+    value = (value ^ _logical_right_shift(value, 30)) * _SPLITMIX64_MIX1
+    value = (value ^ _logical_right_shift(value, 27)) * _SPLITMIX64_MIX2
+    value = value ^ _logical_right_shift(value, 31)
+
+    # torch.remainder treats value as signed. Correct negative values by adding
+    # 2**64 modulo d so the reduction matches the unsigned SplitMix64 output.
+    group_ids = torch.remainder(value, d)
+    unsigned_correction = pow(2, 64, d)
+    if unsigned_correction:
+        group_ids = torch.where(
+            value < 0,
+            torch.remainder(group_ids + unsigned_correction, d),
+            group_ids,
+        )
+    return group_ids
+
+
 
 def generate_random_assignment(
     total_params: int,

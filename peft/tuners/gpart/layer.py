@@ -18,17 +18,205 @@ from typing import List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.autograd.function import once_differentiable
 from transformers.pytorch_utils import Conv1D
 
 from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 from peft.utils.other import transpose
 
 from .._buffer_dict import BufferDict
+from .grouping import generate_implicit_group_ids
+
+
+def _capture_dropout_rng_state(device: torch.device) -> torch.Tensor:
+    if device.type == "cuda":
+        return torch.cuda.get_rng_state(device)
+    if device.type == "cpu":
+        return torch.get_rng_state()
+    raise RuntimeError(f"GPart dropout recomputation is unsupported on {device.type}")
+
+
+def _dropout_mask_like(
+    reference: torch.Tensor,
+    dropout_p: float,
+    rng_state: torch.Tensor | None = None,
+) -> torch.Tensor:
+    def make_mask() -> torch.Tensor:
+        return F.dropout(
+            torch.ones_like(reference),
+            p=dropout_p,
+            training=True,
+        )
+
+    if rng_state is None:
+        return make_mask()
+
+    if reference.device.type == "cuda":
+        device_index = reference.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        with torch.random.fork_rng(devices=[device_index]):
+            torch.cuda.set_rng_state(rng_state, reference.device)
+            return make_mask()
+
+    with torch.random.fork_rng(devices=[]):
+        torch.set_rng_state(rng_state)
+        return make_mask()
+
+
+class _ImplicitGPartLinearFunction(torch.autograd.Function):
+    """GPart contribution with assignment and update recomputation."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        theta: torch.Tensor,
+        scales: torch.Tensor,
+        weight_rows: int,
+        weight_cols: int,
+        bias_numel: int,
+        start_offset: int,
+        d: int,
+        proj_seed: int,
+        fan_in_fan_out: bool,
+        dropout_p: float,
+        training: bool,
+    ) -> torch.Tensor:
+        weight_rows = int(weight_rows)
+        weight_cols = int(weight_cols)
+        bias_numel = int(bias_numel)
+        start_offset = int(start_offset)
+        d = int(d)
+        proj_seed = int(proj_seed)
+        fan_in_fan_out = bool(fan_in_fan_out)
+        dropout_p = float(dropout_p)
+        training = bool(training)
+
+        weight_numel = weight_rows * weight_cols
+        group_ids = generate_implicit_group_ids(
+            start_offset=start_offset,
+            numel=weight_numel + bias_numel,
+            d=d,
+            proj_seed=proj_seed,
+            device=x.device,
+        )
+        delta_flat = (theta * scales).index_select(0, group_ids)
+        delta_weight = delta_flat[:weight_numel].view(weight_rows, weight_cols)
+
+        dropout_rng_state = None
+        if training and dropout_p > 0.0:
+            dropout_rng_state = _capture_dropout_rng_state(x.device)
+            delta_weight = delta_weight * _dropout_mask_like(
+                delta_weight,
+                dropout_p,
+            )
+
+        linear_weight = delta_weight.transpose(0, 1) if fan_in_fan_out else delta_weight
+        delta_bias = None
+        if bias_numel:
+            delta_bias = delta_flat[weight_numel:].view(bias_numel)
+
+        result = F.linear(x, linear_weight, delta_bias)
+
+        ctx.save_for_backward(x, theta, scales)
+        ctx.weight_rows = weight_rows
+        ctx.weight_cols = weight_cols
+        ctx.bias_numel = bias_numel
+        ctx.start_offset = start_offset
+        ctx.d = d
+        ctx.proj_seed = proj_seed
+        ctx.fan_in_fan_out = fan_in_fan_out
+        ctx.dropout_p = dropout_p
+        ctx.training = training
+        ctx.dropout_rng_state = dropout_rng_state
+        return result
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output: torch.Tensor):
+        x, theta, scales = ctx.saved_tensors
+        weight_numel = ctx.weight_rows * ctx.weight_cols
+        group_ids = generate_implicit_group_ids(
+            start_offset=ctx.start_offset,
+            numel=weight_numel + ctx.bias_numel,
+            d=ctx.d,
+            proj_seed=ctx.proj_seed,
+            device=x.device,
+        )
+        delta_flat = (theta * scales).index_select(0, group_ids)
+        delta_weight = delta_flat[:weight_numel].view(
+            ctx.weight_rows,
+            ctx.weight_cols,
+        )
+
+        dropout_mask = None
+        if ctx.training and ctx.dropout_p > 0.0:
+            dropout_mask = _dropout_mask_like(
+                delta_weight,
+                ctx.dropout_p,
+                ctx.dropout_rng_state,
+            )
+            delta_weight = delta_weight * dropout_mask
+
+        linear_weight = (
+            delta_weight.transpose(0, 1) if ctx.fan_in_fan_out else delta_weight
+        )
+        out_features, in_features = linear_weight.shape
+        grad_output_2d = grad_output.reshape(-1, out_features).to(linear_weight.dtype)
+
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            grad_x = grad_output_2d.matmul(linear_weight).view_as(x)
+
+        grad_theta = None
+        if ctx.needs_input_grad[1]:
+            x_2d = x.reshape(-1, in_features)
+            grad_linear_weight = grad_output_2d.transpose(0, 1).matmul(x_2d)
+            grad_weight = (
+                grad_linear_weight.transpose(0, 1)
+                if ctx.fan_in_fan_out
+                else grad_linear_weight
+            )
+            if dropout_mask is not None:
+                grad_weight = grad_weight * dropout_mask
+
+            grad_parts = [grad_weight.reshape(-1)]
+            if ctx.bias_numel:
+                grad_parts.append(grad_output_2d.sum(dim=0))
+            grad_delta_flat = torch.cat(grad_parts)
+
+            grad_source = grad_delta_flat * scales.index_select(0, group_ids)
+            grad_theta = torch.zeros_like(theta)
+            grad_theta.scatter_add_(0, group_ids, grad_source)
+
+        return (
+            grad_x,
+            grad_theta,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 class GPartLayer(BaseTunerLayer):
     adapter_layer_names = ()
-    other_param_names = ("gpart_indices", "gpart_dropout")
+    other_param_names = (
+        "gpart_indices",
+        "gpart_dropout",
+        "_gpart_update_bias",
+        "_gpart_assignment_backend",
+        "_gpart_d",
+        "_gpart_proj_seed",
+        "_gpart_param_offset",
+    )
 
     def __init__(self, base_layer: nn.Module, **kwargs):
         self.base_layer = base_layer
@@ -36,6 +224,10 @@ class GPartLayer(BaseTunerLayer):
 
         self.gpart_indices = BufferDict({}, persistent=False)
         self._gpart_update_bias: dict[str, bool] = {}
+        self._gpart_assignment_backend: dict[str, str] = {}
+        self._gpart_d: dict[str, int] = {}
+        self._gpart_proj_seed: dict[str, int] = {}
+        self._gpart_param_offset: dict[str, int] = {}
 
         self._disable_adapters = False
         self.merged_adapters = []
@@ -68,6 +260,8 @@ class GPartLayer(BaseTunerLayer):
         d: int,
         gpart_dropout: float = 0.0,
         bias_config: str = "none",
+        assignment_backend: str = "legacy_streaming",
+        proj_seed: int = 42,
     ):
         if d <= 0:
             raise ValueError(f"`d` {d} should be a positive integer value")
@@ -81,6 +275,9 @@ class GPartLayer(BaseTunerLayer):
         object.__setattr__(self, "_gpart_global_scales_ref", gpart_global_scales)
 
         self._gpart_update_bias[adapter_name] = bias_config != "none"
+        self._gpart_assignment_backend[adapter_name] = assignment_backend
+        self._gpart_d[adapter_name] = d
+        self._gpart_proj_seed[adapter_name] = int(proj_seed)
 
         self._move_adapter_to_device_of_base_layer(adapter_name)
         self.set_adapter(self.active_adapters)
@@ -100,6 +297,8 @@ class Linear(nn.Linear, GPartLayer):
         fan_in_fan_out: bool = False,
         is_target_conv_1d_layer: bool = False,
         bias_config: str = "none",
+        assignment_backend: str = "legacy_streaming",
+        proj_seed: int = 42,
         **kwargs,
     ) -> None:
         super(nn.Linear, self).__init__()
@@ -113,15 +312,38 @@ class Linear(nn.Linear, GPartLayer):
             d,
             gpart_dropout,
             bias_config=bias_config,
+            assignment_backend=assignment_backend,
+            proj_seed=proj_seed,
         )
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
 
+    def _get_group_ids(
+        self,
+        adapter: str,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if self._gpart_assignment_backend[adapter] == "implicit_stateless_v1":
+            base = self.get_base_layer()
+            bias_numel = (
+                base.bias.numel()
+                if self._gpart_update_bias.get(adapter, False) and base.bias is not None
+                else 0
+            )
+            return generate_implicit_group_ids(
+                start_offset=self._gpart_param_offset[adapter],
+                numel=base.weight.numel() + bias_numel,
+                d=self._gpart_d[adapter],
+                proj_seed=self._gpart_proj_seed[adapter],
+                device=device,
+            )
+
+        indices = self.gpart_indices[adapter]
+        return indices if indices.device == device else indices.to(device)
+
     def _compute_delta_flat(self, adapter: str, cast_to_fp32: bool) -> torch.Tensor:
         theta_d = self._gpart_theta_d_ref[adapter]
-        indices = self.gpart_indices[adapter]
         device = theta_d.device
-        if indices.device != device:
-            indices = indices.to(device)
+        indices = self._get_group_ids(adapter, device)
         scales = self._gpart_global_scales_ref[adapter]
         if scales.device != device:
             scales = scales.to(device)
@@ -130,12 +352,12 @@ class Linear(nn.Linear, GPartLayer):
             theta_d = theta_d.float()
             scales = scales.float()
 
-        return theta_d[indices] * scales[indices]
+        return (theta_d * scales)[indices]
 
     def get_delta_weight(self, adapter: str) -> torch.Tensor:
-        device = self.gpart_indices[adapter].device
-        dtype = self._gpart_theta_d_ref[adapter].dtype
-        cast_to_fp32 = device.type == "cpu" and dtype == torch.float16
+        theta_d = self._gpart_theta_d_ref[adapter]
+        dtype = theta_d.dtype
+        cast_to_fp32 = theta_d.device.type == "cpu" and dtype == torch.float16
 
         delta_flat = self._compute_delta_flat(adapter, cast_to_fp32)
         weight_shape = self.get_base_layer().weight.shape
@@ -165,7 +387,7 @@ class Linear(nn.Linear, GPartLayer):
             return
 
         for active_adapter in adapter_names:
-            if active_adapter not in self.gpart_indices.keys():
+            if active_adapter not in self.gpart_dropout:
                 continue
 
             base_layer = self.get_base_layer()
@@ -211,7 +433,7 @@ class Linear(nn.Linear, GPartLayer):
 
         while len(self.merged_adapters) > 0:
             active_adapter = self.merged_adapters.pop()
-            if active_adapter not in self.gpart_indices.keys():
+            if active_adapter not in self.gpart_dropout:
                 continue
             base_layer = self.get_base_layer()
             delta_w = self.get_delta_weight(active_adapter)
@@ -241,60 +463,68 @@ class Linear(nn.Linear, GPartLayer):
             return self.base_layer(x, *args, **kwargs).to(previous_dtype)
 
         valid_adapters = [
-            adapter
-            for adapter in self.active_adapters
-            if adapter in self.gpart_indices.keys()
+            adapter for adapter in self.active_adapters if adapter in self.gpart_dropout
         ]
-
+        result = self.base_layer(x, *args, **kwargs)
         if not valid_adapters:
-            return self.base_layer(x, *args, **kwargs).to(previous_dtype)
+            return result.to(previous_dtype)
 
         base = self.get_base_layer()
-
         target_dtype = base.weight.dtype
         target_device = base.weight.device
-
         x_in = x.to(device=target_device, dtype=target_dtype)
 
-        eff_weight = base.weight
-        eff_bias = base.bias
-
-        for active_adapter in self.active_adapters:
-            if active_adapter not in self.gpart_indices:
-                continue
-
-            indices = self.gpart_indices[active_adapter]
-            if indices.device != target_device:
-                indices = indices.to(target_device)
-
+        for active_adapter in valid_adapters:
             theta = self._gpart_theta_d_ref[active_adapter].to(
-                device=target_device, dtype=target_dtype
+                device=target_device,
+                dtype=target_dtype,
             )
             scales = self._gpart_global_scales_ref[active_adapter].to(
-                device=target_device, dtype=target_dtype
+                device=target_device,
+                dtype=target_dtype,
             )
-
-            delta_flat = (theta[indices] * scales[indices]).to(target_dtype)
-
-            w_numel = base.weight.numel()
-            delta_w = delta_flat[:w_numel].view_as(base.weight)
-            delta_w = self.gpart_dropout[active_adapter](delta_w).to(target_dtype)
-            eff_weight = eff_weight + delta_w
-
-            if (
+            update_bias = (
                 self._gpart_update_bias.get(active_adapter, False)
                 and base.bias is not None
-            ):
-                delta_b = delta_flat[w_numel : w_numel + base.bias.numel()].view_as(
-                    base.bias
-                )
-                delta_b = delta_b.to(dtype=base.bias.dtype, device=base.bias.device)
-                eff_bias = delta_b if eff_bias is None else (eff_bias + delta_b)
+            )
+            bias_numel = base.bias.numel() if update_bias else 0
 
-        if eff_weight.dtype != x_in.dtype:
-            eff_weight = eff_weight.to(x_in.dtype)
-        if eff_bias is not None and eff_bias.dtype != x_in.dtype:
-            eff_bias = eff_bias.to(x_in.dtype)
-        
-        out = F.linear(x_in, eff_weight, eff_bias)
-        return out.to(previous_dtype)
+            if (
+                self._gpart_assignment_backend[active_adapter]
+                == "implicit_stateless_v1"
+            ):
+                dropout = self.gpart_dropout[active_adapter]
+                dropout_p = dropout.p if isinstance(dropout, nn.Dropout) else 0.0
+                contribution = _ImplicitGPartLinearFunction.apply(
+                    x_in,
+                    theta,
+                    scales,
+                    base.weight.shape[0],
+                    base.weight.shape[1],
+                    bias_numel,
+                    self._gpart_param_offset[active_adapter],
+                    self._gpart_d[active_adapter],
+                    self._gpart_proj_seed[active_adapter],
+                    self.fan_in_fan_out,
+                    dropout_p,
+                    dropout.training,
+                )
+            else:
+                indices = self.gpart_indices[active_adapter]
+                if indices.device != target_device:
+                    indices = indices.to(target_device)
+                delta_flat = (theta * scales)[indices]
+
+                weight_numel = base.weight.numel()
+                delta_weight = delta_flat[:weight_numel].view_as(base.weight)
+                delta_weight = self.gpart_dropout[active_adapter](delta_weight)
+                linear_weight = transpose(delta_weight, self.fan_in_fan_out)
+
+                delta_bias = None
+                if bias_numel:
+                    delta_bias = delta_flat[weight_numel:].view_as(base.bias)
+                contribution = F.linear(x_in, linear_weight, delta_bias)
+
+            result = result + contribution.to(result.dtype)
+
+        return result.to(previous_dtype)

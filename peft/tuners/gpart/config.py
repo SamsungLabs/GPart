@@ -58,6 +58,10 @@ class GPartConfig(PeftConfig):
             The strategy for assigning parameters to groups. Options are:
             - "random": Random partition using proj_seed (default, original GPart behavior)
             - "signed_magnitude": Deterministic partition by sign and magnitude of pretrained weights
+        assignment_backend (`str`):
+            The versioned random-assignment implementation. "legacy_streaming" preserves the existing seeded
+            torch.randint mapping. "implicit_stateless_v1" derives assignments from the seed and canonical global
+            parameter position without storing per-parameter index buffers.
         layers_to_transform (`Union[List[int],int]`):
             The layer indices to transform. If a list of ints is passed, it will apply the adapter to the layer indices
             that are specified in this list. If a single integer is passed, it will apply the transformations on the
@@ -143,6 +147,17 @@ class GPartConfig(PeftConfig):
             )
         },
     )
+    assignment_backend: Literal[
+        "legacy_streaming", "implicit_stateless_v1"
+    ] = field(
+        default="implicit_stateless_v1",
+        metadata={
+            "help": (
+                "Versioned assignment backend for random grouping. Use "
+                "'implicit_stateless_v1' to avoid persistent per-parameter assignments."
+            )
+        },
+    )
     layers_to_transform: Optional[Union[List[int], int]] = field(
         default=None,
         metadata={
@@ -171,7 +186,23 @@ class GPartConfig(PeftConfig):
     )
 
     def __post_init__(self):
+        super().__post_init__()
         self.peft_type = PeftType.GPART
+        if self.assignment_backend not in {
+            "legacy_streaming",
+            "implicit_stateless_v1",
+        }:
+            raise ValueError(
+                f"Unknown GPart assignment backend: {self.assignment_backend!r}"
+            )
+        if (
+            self.assignment_backend == "implicit_stateless_v1"
+            and self.grouping_strategy != "random"
+        ):
+            raise ValueError(
+                "assignment_backend='implicit_stateless_v1' is only supported "
+                "with grouping_strategy='random'"
+            )
         self.target_modules = (
             set(self.target_modules)
             if isinstance(self.target_modules, list)

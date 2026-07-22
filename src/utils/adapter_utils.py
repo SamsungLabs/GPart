@@ -82,6 +82,7 @@ def get_peft_config(
             "isometric",
             "grouping_strategy",
             "bias",
+            "assignment_backend",
         ]:
             if k in adapter_config:
                 kwargs[k] = adapter_config[k]
