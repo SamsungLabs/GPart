@@ -443,7 +443,7 @@ class GPartLayer(BaseTunerLayer):
         d: int,
         gpart_dropout: float = 0.0,
         bias_config: str = "none",
-        assignment_backend: str = "legacy_streaming",
+        assignment_backend: str = "materialized",
         proj_seed: int = 42,
         projection_type: str = "partition",
         isometric: bool = True,
@@ -494,7 +494,7 @@ class Linear(nn.Linear, GPartLayer):
         fan_in_fan_out: bool = False,
         is_target_conv_1d_layer: bool = False,
         bias_config: str = "none",
-        assignment_backend: str = "legacy_streaming",
+        assignment_backend: str = "materialized",
         proj_seed: int = 42,
         projection_type: str = "partition",
         isometric: bool = True,
@@ -526,7 +526,7 @@ class Linear(nn.Linear, GPartLayer):
         adapter: str,
         device: torch.device,
     ) -> torch.Tensor:
-        if self._gpart_assignment_backend[adapter] == "implicit_stateless_v1":
+        if self._gpart_assignment_backend[adapter] == "stateless":
             base = self.get_base_layer()
             bias_numel = (
                 base.bias.numel()
@@ -748,7 +748,7 @@ class Linear(nn.Linear, GPartLayer):
                 )
             elif (
                 self._gpart_assignment_backend[active_adapter]
-                == "implicit_stateless_v1"
+                == "stateless"
             ):
                 contribution = _ImplicitGPartLinearFunction.apply(
                     x_in,

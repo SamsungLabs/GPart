@@ -110,12 +110,12 @@ parser.add_argument(
 parser.add_argument(
     "--assignment_backend",
     type=str,
-    default="legacy_streaming",
-    choices=["legacy_streaming", "implicit_stateless_v1"],
+    default="materialized",
+    choices=["materialized", "stateless", "legacy_streaming", "implicit_stateless_v1"],
     help=(
-        "GPart assignment backend: 'legacy_streaming' (torch.randint-based, default) "
-        "or 'implicit_stateless_v1' (stateless SplitMix64 hash). "
-        "Only used with --adapter_type gpart."
+        "GPart assignment backend: 'materialized' (torch.randint-based, default) "
+        "or 'stateless' (SplitMix64 hash). Deprecated aliases: 'legacy_streaming' "
+        "and 'implicit_stateless_v1'. Only used with --adapter_type gpart."
     ),
 )
 

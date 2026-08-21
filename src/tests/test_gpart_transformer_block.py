@@ -59,7 +59,7 @@ class ScalarTransformer(nn.Module):
 def make_block_model(
     *,
     d: int = 10,
-    backend: str = "implicit_stateless_v1",
+    backend: str = "stateless",
     bias: str = "none",
     init_bound: float = 0.2,
     block_count: int = 3,
@@ -96,7 +96,7 @@ def explicit_layer_output(layer, x, adapter="default"):
         if layer._gpart_update_bias[adapter] and base.bias is not None
         else 0
     )
-    if layer._gpart_assignment_backend[adapter] == "implicit_stateless_v1":
+    if layer._gpart_assignment_backend[adapter] == "stateless":
         group_ids = generate_implicit_group_ids(
             start_offset=layer._gpart_param_offset[adapter],
             numel=base.weight.numel() + bias_numel,
@@ -230,7 +230,7 @@ def test_unresolved_target_and_invalid_allocations_fail_clearly():
         )
 
 
-@pytest.mark.parametrize("backend", ["legacy_streaming", "implicit_stateless_v1"])
+@pytest.mark.parametrize("backend", ["materialized", "stateless"])
 def test_block_local_offsets_assignments_and_scales(backend):
     model = make_block_model(d=10, backend=backend, bias="all")
     base_model = model.base_model
@@ -245,7 +245,7 @@ def test_block_local_offsets_assignments_and_scales(backend):
             assert layer._gpart_proj_seed["default"] == manifest.proj_seed
             base = layer.get_base_layer()
             layer_numel = base.weight.numel() + base.bias.numel()
-            if backend == "implicit_stateless_v1":
+            if backend == "stateless":
                 layer_ids = generate_implicit_group_ids(
                     expected_offset,
                     layer_numel,
@@ -278,7 +278,7 @@ def test_signed_magnitude_grouping_is_independent_per_block():
             target_modules=["query", "value"],
             partition_scope="transformer_block",
             grouping_strategy="signed_magnitude",
-            assignment_backend="legacy_streaming",
+            assignment_backend="materialized",
             bias="all",
             proj_seed=17,
         ),
@@ -337,7 +337,7 @@ def test_zero_init_merge_disable_save_reload_and_adapter_deletion(tmp_path):
             d=9,
             target_modules=["query", "value"],
             partition_scope="transformer_block",
-            assignment_backend="implicit_stateless_v1",
+            assignment_backend="stateless",
             proj_seed=23,
         ),
     )
@@ -368,7 +368,7 @@ def test_zero_init_merge_disable_save_reload_and_adapter_deletion(tmp_path):
             d=6,
             target_modules=["query", "value"],
             partition_scope="transformer_block",
-            assignment_backend="implicit_stateless_v1",
+            assignment_backend="stateless",
             proj_seed=99,
         ),
     )

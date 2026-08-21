@@ -12,11 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional, Union
 
 from peft.config import PeftConfig
 from peft.utils import PeftType
+
+
+_DEPRECATED_ASSIGNMENT_BACKENDS = {
+    "legacy_streaming": "materialized",
+    "implicit_stateless_v1": "stateless",
+}
 
 
 @dataclass
@@ -68,8 +75,8 @@ class GPartConfig(PeftConfig):
             - "random": Random partition using proj_seed (default, original GPart behavior)
             - "signed_magnitude": Deterministic partition by sign and magnitude of pretrained weights
         assignment_backend (`str`):
-            The versioned random-assignment implementation. "legacy_streaming" preserves the existing seeded
-            torch.randint mapping. "implicit_stateless_v1" derives assignments from the seed and canonical global
+            The random-assignment implementation. "materialized" preserves the existing seeded
+            torch.randint mapping. "stateless" derives assignments from the seed and canonical global
             parameter position without storing per-parameter index buffers.
         layers_to_transform (`Union[List[int],int]`):
             The layer indices to transform. If a list of ints is passed, it will apply the adapter to the layer indices
@@ -176,14 +183,12 @@ class GPartConfig(PeftConfig):
             )
         },
     )
-    assignment_backend: Literal[
-        "legacy_streaming", "implicit_stateless_v1"
-    ] = field(
-        default="implicit_stateless_v1",
+    assignment_backend: Literal["materialized", "stateless"] = field(
+        default="stateless",
         metadata={
             "help": (
-                "Versioned assignment backend for random grouping. Use "
-                "'implicit_stateless_v1' to avoid persistent per-parameter assignments."
+                "Random-assignment backend. Use 'stateless' to avoid persistent "
+                "per-parameter assignments."
             )
         },
     )
@@ -218,6 +223,15 @@ class GPartConfig(PeftConfig):
     def __post_init__(self):
         super().__post_init__()
         self.peft_type = PeftType.GPART
+        replacement = _DEPRECATED_ASSIGNMENT_BACKENDS.get(self.assignment_backend)
+        if replacement is not None:
+            warnings.warn(
+                f"assignment_backend={self.assignment_backend!r} is deprecated; "
+                f"use {replacement!r} instead.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            self.assignment_backend = replacement
         if self.projection_type not in {"partition", "fastfood"}:
             raise ValueError(
                 f"Unknown GPart projection type: {self.projection_type!r}"
@@ -251,18 +265,18 @@ class GPartConfig(PeftConfig):
                 "RMS-preserving non-isometric Fastfood requires d >= 2"
             )
         if self.assignment_backend not in {
-            "legacy_streaming",
-            "implicit_stateless_v1",
+            "materialized",
+            "stateless",
         }:
             raise ValueError(
                 f"Unknown GPart assignment backend: {self.assignment_backend!r}"
             )
         if (
-            self.assignment_backend == "implicit_stateless_v1"
+            self.assignment_backend == "stateless"
             and self.grouping_strategy != "random"
         ):
             raise ValueError(
-                "assignment_backend='implicit_stateless_v1' is only supported "
+                "assignment_backend='stateless' is only supported "
                 "with grouping_strategy='random'"
             )
         self.target_modules = (

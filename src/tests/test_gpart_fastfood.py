@@ -48,13 +48,45 @@ def make_model(*, dropout=0.0, init_bound=0.2, bias="all", seed=9):
             gpart_dropout=dropout,
             init_bound=init_bound,
             proj_seed=seed,
-            assignment_backend="implicit_stateless_v1",
+            assignment_backend="stateless",
         ),
     )
 
 
 def gpart_layers(model):
     return [module for module in model.modules() if isinstance(module, Linear)]
+
+
+@pytest.mark.parametrize(
+    ("deprecated_backend", "replacement"),
+    [
+        ("legacy_streaming", "materialized"),
+        ("implicit_stateless_v1", "stateless"),
+    ],
+)
+def test_config_normalizes_deprecated_assignment_backends(
+    deprecated_backend, replacement, tmp_path
+):
+    with pytest.warns(
+        FutureWarning,
+        match=rf"assignment_backend='{deprecated_backend}'.*'{replacement}'",
+    ):
+        config = GPartConfig(
+            target_modules=["l1"], assignment_backend=deprecated_backend
+        )
+    assert config.assignment_backend == replacement
+
+    config.save_pretrained(tmp_path)
+    config_path = tmp_path / "adapter_config.json"
+    payload = json.loads(config_path.read_text())
+    payload["assignment_backend"] = deprecated_backend
+    config_path.write_text(json.dumps(payload))
+    with pytest.warns(
+        FutureWarning,
+        match=rf"assignment_backend='{deprecated_backend}'.*'{replacement}'",
+    ):
+        loaded = GPartConfig.from_pretrained(tmp_path)
+    assert loaded.assignment_backend == replacement
 
 
 def explicit_matrix(

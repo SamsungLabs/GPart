@@ -174,18 +174,18 @@ For the standard GPart `partition` projection with `grouping_strategy="random"`,
 
 | Backend | Trade-off | Use when |
 | ------- | --------- | -------- |
-| `legacy_streaming` | Slightly faster, but stores a persistent group ID for every adapted parameter. Its extra memory grows with the number of adapted weights. | Memory is available and you want the fastest assignment lookup. |
-| `implicit_stateless_v1` (default) | Recomputes group IDs deterministically from `proj_seed` and global parameter position. It has no persistent per-parameter assignment buffer, with a small compute cost. | Fine-tuning large models or minimizing adapter memory overhead. |
+| `materialized` | Slightly faster, but stores a persistent group ID for every adapted parameter. Its extra memory grows with the number of adapted weights. | Memory is available and you want the fastest assignment lookup. |
+| `stateless` (default) | Recomputes group IDs deterministically from `proj_seed` and global parameter position. It has no persistent per-parameter assignment buffer, with a small compute cost. | Fine-tuning large models or minimizing adapter memory overhead. |
 
 Select a backend with a CLI override:
 
 ```bash
 python src/scripts/math/finetune_metamath.py \
   --adapter_type gpart \
-  adapter.assignment_backend implicit_stateless_v1
+  adapter.assignment_backend stateless
 ```
 
-`implicit_stateless_v1` is supported only with `grouping_strategy="random"`. Use `legacy_streaming` when using another grouping strategy.
+`stateless` is supported only with `grouping_strategy="random"`. Deprecated aliases `legacy_streaming` and `implicit_stateless_v1` remain accepted with a `FutureWarning`; use `materialized` and `stateless` in new configurations.
 
 #### Config Structure
 
