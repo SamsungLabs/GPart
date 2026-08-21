@@ -25,9 +25,7 @@ class GPARTConfig(AdapterConfig):
     proj_seed: Optional[int] = None  # None follows the run seed
     partition_scope: Literal["global", "transformer_block"] = "global"
     grouping_strategy: Literal["random", "signed_magnitude"] = "random"
-    assignment_backend: Literal["legacy_streaming", "implicit_stateless_v1"] = (
-        "implicit_stateless_v1"
-    )
+    assignment_backend: Literal["materialized", "stateless"] = "stateless"
     bias: str = (
         "none"  # "none" = exclude biases from partition; "all"/"gpart_only" = include
     )

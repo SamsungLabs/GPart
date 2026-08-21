@@ -403,7 +403,7 @@ class GPartModel(BaseTuner):
                 del state[adapter_name]
 
         if strategy == "random":
-            if assignment_backend == "implicit_stateless_v1":
+            if assignment_backend == "stateless":
                 group_counts = self._count_implicit_groups_streaming(
                     gpart_layers=gpart_layers,
                     adapter_name=adapter_name,
@@ -521,7 +521,7 @@ class GPartModel(BaseTuner):
                 layer._gpart_total_params[adapter_name] = total_params
 
             if gpart_config.grouping_strategy == "random":
-                if gpart_config.assignment_backend == "implicit_stateless_v1":
+                if gpart_config.assignment_backend == "stateless":
                     group_counts = self._count_implicit_groups_streaming(
                         gpart_layers=layers,
                         adapter_name=adapter_name,

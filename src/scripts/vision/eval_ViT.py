@@ -105,11 +105,12 @@ parser.add_argument(
     "--assignment_backend",
     type=str,
     default=None,
-    choices=["legacy_streaming", "implicit_stateless_v1"],
+    choices=["materialized", "stateless", "legacy_streaming", "implicit_stateless_v1"],
     help=(
         "Override the GPart assignment_backend when loading a GPart adapter. "
-        "Use 'legacy_streaming' (torch.randint-based) or 'implicit_stateless_v1' "
-        "(stateless SplitMix64 hash). Only applies to GPart adapters; ignored for "
+        "Use 'materialized' (torch.randint-based) or 'stateless' (SplitMix64 hash). "
+        "Deprecated aliases: 'legacy_streaming' and 'implicit_stateless_v1'. Only "
+        "applies to GPart adapters; ignored for "
         "other PEFT types. WARNING: changing the backend from what was used during "
         "training will produce different group assignments and scales, likely "
         "degrading accuracy — the saved theta_d was optimized for the original backend."
@@ -367,7 +368,7 @@ def evaluate_adapter(
     )
     if use_override:
         saved_backend = adapter_config.get(
-            "assignment_backend", "legacy_streaming"
+            "assignment_backend", "materialized"
         )
         if saved_backend != assignment_backend_override:
             print(

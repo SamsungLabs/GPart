@@ -233,12 +233,18 @@ def parse_args():
     g.add_argument(
         "--assignment_backend",
         type=str,
-        choices=["legacy_streaming", "implicit_stateless_v1"],
-        default="legacy_streaming",
+        choices=[
+            "materialized",
+            "stateless",
+            "legacy_streaming",
+            "implicit_stateless_v1",
+        ],
+        default="materialized",
         help=(
-            "GPart random-assignment backend. 'legacy_streaming' (default) preserves "
-            "the existing seeded torch.randint mapping; 'implicit_stateless_v1' "
-            "derives assignments from the seed and canonical global parameter position."
+            "GPart random-assignment backend. 'materialized' (default) preserves "
+            "the seeded torch.randint mapping; 'stateless' derives assignments from "
+            "the seed and canonical global parameter position. Deprecated aliases: "
+            "'legacy_streaming' and 'implicit_stateless_v1'."
         ),
     )
 

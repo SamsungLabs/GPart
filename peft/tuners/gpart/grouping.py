@@ -65,7 +65,7 @@ def generate_implicit_group_ids(
 ) -> torch.Tensor:
     """Generate stateless random GPart group IDs for a global interval.
 
-    The implicit_stateless_v1 mapping is SplitMix64 applied to the sum of
+    The stateless mapping is SplitMix64 applied to the sum of
     the projection seed and canonical global parameter index, followed by
     unsigned reduction modulo d. The function is independent of PyTorch's
     RNG state, call order, and interval chunking.
