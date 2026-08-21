@@ -168,6 +168,25 @@ Values are resolved with the following precedence (later overrides earlier):
 5. CLI overrides              ← Key-value pairs after the main flags
 ```
 
+#### Assignment Backends
+
+For the standard GPart `partition` projection with `grouping_strategy="random"`, choose the random-assignment backend that fits the available memory budget:
+
+| Backend | Trade-off | Use when |
+| ------- | --------- | -------- |
+| `legacy_streaming` | Slightly faster, but stores a persistent group ID for every adapted parameter. Its extra memory grows with the number of adapted weights. | Memory is available and you want the fastest assignment lookup. |
+| `implicit_stateless_v1` (default) | Recomputes group IDs deterministically from `proj_seed` and global parameter position. It has no persistent per-parameter assignment buffer, with a small compute cost. | Fine-tuning large models or minimizing adapter memory overhead. |
+
+Select a backend with a CLI override:
+
+```bash
+python src/scripts/math/finetune_metamath.py \
+  --adapter_type gpart \
+  adapter.assignment_backend implicit_stateless_v1
+```
+
+`implicit_stateless_v1` is supported only with `grouping_strategy="random"`. Use `legacy_streaming` when using another grouping strategy.
+
 #### Config Structure
 
 The central object is `ExperimentConfig`, which composes three sub-configs:
