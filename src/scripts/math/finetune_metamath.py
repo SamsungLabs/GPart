@@ -6,6 +6,7 @@ import os
 import re
 import warnings
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -126,6 +127,14 @@ def get_trainable_params_count(model) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+def write_output_dir_file(output_dir: str, output_dir_file: str) -> Path:
+    output_path = Path(output_dir).resolve()
+    path_file = Path(output_dir_file)
+    path_file.parent.mkdir(parents=True, exist_ok=True)
+    path_file.write_text(f"{output_path}\n", encoding="utf-8")
+    return path_file
+
+
 def build_run_name(args, trainable_params_count: int) -> str:
     parts = [
         "metamath",
@@ -190,6 +199,7 @@ def build_adapter_config(args):
             target_modules=TARGET_MODULES,
             gpart_dropout=args.dropout,
             init_bound=args.init_bound,
+            assignment_backend=args.assignment_backend,
             bias="none",
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,
@@ -220,6 +230,17 @@ def parse_args():
     g.add_argument("--dropout", type=float, default=0.05)
     g.add_argument("--d", type=int, default=524288)
     g.add_argument("--init_bound", type=float, default=0.0)
+    g.add_argument(
+        "--assignment_backend",
+        type=str,
+        choices=["legacy_streaming", "implicit_stateless_v1"],
+        default="legacy_streaming",
+        help=(
+            "GPart random-assignment backend. 'legacy_streaming' (default) preserves "
+            "the existing seeded torch.randint mapping; 'implicit_stateless_v1' "
+            "derives assignments from the seed and canonical global parameter position."
+        ),
+    )
 
     g = p.add_argument_group("Dataset")
     g.add_argument("--dataset_name", type=str, default="meta-math/MetaMathQA")
@@ -230,6 +251,15 @@ def parse_args():
 
     g = p.add_argument_group("Training")
     g.add_argument("--output_root_dir", type=str, default="./experiments/outputs")
+    g.add_argument(
+        "--output_dir_file",
+        type=str,
+        default=None,
+        help=(
+            "Optional file that receives the absolute final adapter directory after "
+            "training and all final saves succeed."
+        ),
+    )
     g.add_argument("--num_train_epochs", type=float, default=2)
     g.add_argument("--per_device_train_batch_size", type=int, default=2)
     g.add_argument("--gradient_accumulation_steps", type=int, default=8)
@@ -359,6 +389,10 @@ def main():
     trainer.log_metrics("train", metrics)
     trainer.save_metrics("train", metrics)
     trainer.save_state()
+
+    if args.output_dir_file:
+        path_file = write_output_dir_file(output_dir, args.output_dir_file)
+        logging.info(f"Output directory path written to: {path_file}")
 
     logging.info("Done.")
 

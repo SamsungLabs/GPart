@@ -54,6 +54,15 @@ class GPartConfig(PeftConfig):
             When non-zero, theta_d is initialized with a uniform distribution between -init_bound and init_bound.
         proj_seed (`int`):
             Random seed for initializing the parameter-to-group assignments (used for "random" strategy).
+        projection_type (`str`):
+            The global projection from theta into the flattened adapted weight space:
+            - "partition": the sparse normalized GPart partition (default)
+            - "fastfood": a structured dense DID-style Fastfood projection
+        partition_scope (`str`):
+            The scope used to construct the standard GPart partition:
+            - "global": one partition across every adapted parameter (default)
+            - "transformer_block": independent partitions for numbered transformer blocks
+              that use disjoint slices of the total length-``d`` coordinate vector
         grouping_strategy (`str`):
             The strategy for assigning parameters to groups. Options are:
             - "random": Random partition using proj_seed (default, original GPart behavior)
@@ -69,11 +78,12 @@ class GPartConfig(PeftConfig):
         layers_pattern (`str`):
             The layer pattern name, used only if `layers_to_transform` is different from `None`.
         isometric (`bool`):
-            If True (default), the partition matrix P satisfies P^T P = I_d:
-            each column is normalized by 1/sqrt(group_size), making the map from
-            theta_d to weight space an isometric embedding.
-            If False, no normalization is applied (P^T P = diag(n_1,...,n_d)),
-            which is simpler but does not preserve Euclidean distances.
+            For ``projection_type="partition"``, True (default) makes the
+            partition matrix satisfy P^T P = I_d exactly; False omits its
+            column normalization. For ``projection_type="fastfood"``, both
+            modes apply 1/sqrt(D*L). True gives E[P^T P] = I_d, while False
+            applies RMS-one unequal directional gains with a 4:1 ratio to
+            create an RMS-matched anisotropic projection.
     """
 
     d: int = field(
@@ -138,6 +148,25 @@ class GPartConfig(PeftConfig):
             "help": "Random seed for initializing the parameter-to-group assignments."
         },
     )
+    projection_type: Literal["partition", "fastfood"] = field(
+        default="partition",
+        metadata={
+            "help": (
+                "Global projection type. 'partition' uses the sparse GPart "
+                "partition; 'fastfood' uses a structured dense Fastfood projection."
+            )
+        },
+    )
+    partition_scope: Literal["global", "transformer_block"] = field(
+        default="global",
+        metadata={
+            "help": (
+                "Partition scope. 'global' uses one model-wide GPart partition; "
+                "'transformer_block' divides the total d coordinates across "
+                "independent numbered transformer-block partitions."
+            )
+        },
+    )
     grouping_strategy: Literal["random", "signed_magnitude"] = field(
         default="random",
         metadata={
@@ -179,8 +208,9 @@ class GPartConfig(PeftConfig):
                 "If True (default), the partition matrix P satisfies P^T P = I_d: "
                 "each column is normalized by 1/sqrt(group_size), making the map from "
                 "theta_d to weight space an isometric embedding. "
-                "If False, no normalization is applied (P^T P = diag(n_1,...,n_d)), "
-                "which is simpler but does not preserve Euclidean distances."
+                "For the partition projection, False omits column normalization "
+                "(P^T P = diag(n_1,...,n_d)). For Fastfood, False retains "
+                "RMS normalization but applies fixed unequal directional gains."
             )
         },
     )
@@ -188,6 +218,38 @@ class GPartConfig(PeftConfig):
     def __post_init__(self):
         super().__post_init__()
         self.peft_type = PeftType.GPART
+        if self.projection_type not in {"partition", "fastfood"}:
+            raise ValueError(
+                f"Unknown GPart projection type: {self.projection_type!r}"
+            )
+        if self.partition_scope not in {"global", "transformer_block"}:
+            raise ValueError(
+                f"Unknown GPart partition scope: {self.partition_scope!r}"
+            )
+        if (
+            self.partition_scope == "transformer_block"
+            and self.projection_type != "partition"
+        ):
+            raise ValueError(
+                "partition_scope='transformer_block' is only supported with "
+                "projection_type='partition'"
+            )
+        if (
+            self.projection_type == "fastfood"
+            and self.grouping_strategy != "random"
+        ):
+            raise ValueError(
+                "projection_type='fastfood' is only supported with "
+                "grouping_strategy='random'"
+            )
+        if (
+            self.projection_type == "fastfood"
+            and not self.isometric
+            and self.d < 2
+        ):
+            raise ValueError(
+                "RMS-preserving non-isometric Fastfood requires d >= 2"
+            )
         if self.assignment_backend not in {
             "legacy_streaming",
             "implicit_stateless_v1",

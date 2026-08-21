@@ -32,6 +32,7 @@ from transformers import (
 import peft
 from peft import GPartConfig, LoraConfig, get_peft_model
 from peft.tuners.unilora import UniLoRAConfig
+from peft.utils.save_and_load import load_peft_weights
 
 # Configure logging to display INFO-level messages from GPart grouping module
 logging.basicConfig(level=logging.INFO, format="%(name)s - %(levelname)s - %(message)s")
@@ -106,9 +107,19 @@ parser.add_argument(
     default="random",
     choices=["random", "signed_magnitude"],
 )
+parser.add_argument(
+    "--assignment_backend",
+    type=str,
+    default="legacy_streaming",
+    choices=["legacy_streaming", "implicit_stateless_v1"],
+    help=(
+        "GPart assignment backend: 'legacy_streaming' (torch.randint-based, default) "
+        "or 'implicit_stateless_v1' (stateless SplitMix64 hash). "
+        "Only used with --adapter_type gpart."
+    ),
+)
 
 args_custom = parser.parse_args()
-
 
 def set_seed(seed):
     random.seed(seed)
@@ -377,11 +388,14 @@ def build_adapter_config(args):
         return GPartConfig(
             d=d,
             target_modules=["query", "value"],
+            modules_to_save=["classifier"],
             gpart_dropout=args.dropout,
             bias="none",
             inference_mode=False,
             grouping_strategy=args.grouping_strategy,
             init_bound=args.init_bound,
+            assignment_backend=args.assignment_backend,
+            proj_seed=args.seed,
         )
 
     if args.adapter_type == "unilora":
@@ -389,6 +403,7 @@ def build_adapter_config(args):
             r=args.rank,
             theta_d_length=d,
             target_modules=["query", "value"],
+            modules_to_save=["classifier"],
             unilora_dropout=args.dropout,
             bias="none",
             inference_mode=False,
@@ -400,6 +415,7 @@ def build_adapter_config(args):
             r=args.rank,
             lora_alpha=args.lora_alpha,
             target_modules=["query", "value"],
+            modules_to_save=["classifier"],
             lora_dropout=args.dropout,
             bias="none",
             inference_mode=False,
@@ -527,6 +543,21 @@ train_results = trainer.train()
 # Save the best model directly in the run directory (not in a checkpoint subdirectory)
 lora_model.save_pretrained(output_dir)
 image_processor.save_pretrained(output_dir)
+
+saved_weights = load_peft_weights(output_dir, device="cpu")
+classifier_keys = {
+    key.rsplit(".", 1)[-1]
+    for key in saved_weights
+    if "classifier" in key.split(".")
+}
+missing_classifier_keys = {"weight", "bias"} - classifier_keys
+if missing_classifier_keys:
+    missing = ", ".join(sorted(missing_classifier_keys))
+    raise RuntimeError(
+        f"Saved adapter is missing classifier {missing}. "
+        "The checkpoint cannot be evaluated in a fresh process."
+    )
+print("Verified saved classifier weight and bias.")
 print(f"Best model saved to: {output_dir}")
 
 # Evaluate on test set and save results

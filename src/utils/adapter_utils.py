@@ -80,16 +80,20 @@ def get_peft_config(
             "d",
             "init_bound",
             "isometric",
+            "projection_type",
+            "partition_scope",
             "grouping_strategy",
             "bias",
             "assignment_backend",
         ]:
             if k in adapter_config:
                 kwargs[k] = adapter_config[k]
-        # Always use the main seed for GPart proj_seed to ensure reproducibility
-        kwargs["proj_seed"] = adapter_config.get(
-            "main_seed", 0
-        )  # Default to 0 if not provided
+        # An explicit projection seed supports controlled projection studies;
+        # otherwise it follows the training/run seed used by reported GPart runs.
+        proj_seed = adapter_config.get("proj_seed")
+        kwargs["proj_seed"] = (
+            adapter_config.get("main_seed", 0) if proj_seed is None else proj_seed
+        )
     # Add target modules if not already in kwargs
     if "target_modules" not in kwargs:
         kwargs["target_modules"] = target_modules

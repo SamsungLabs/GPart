@@ -17,4 +17,22 @@ wheels/
 *.pt
 *.safetensors
 *.ckpt
+logs/
+outputs/
+
+# other files and dirs
+noisy_graphext_qa
+mlflow.db
+mlruns
+vit_output
+data/dtd
+data/fgvc-aircraft-2013b
+experiments
+data/commonsense_15k.json
+data/eval_datasets
+data/memory_data
 uv.lock
+rebuttal_fastfood
+rebuttal_stateless
+data/*.tar.gz
+.workspace_rag/

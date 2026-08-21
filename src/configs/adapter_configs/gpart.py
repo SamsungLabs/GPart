@@ -6,7 +6,7 @@ random grouping of parameters with shared low-rank adaptation.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal
+from typing import Dict, List, Literal, Optional
 
 from configs.base_config import AdapterConfig, TaskConfig
 
@@ -20,7 +20,10 @@ class GPARTConfig(AdapterConfig):
     dropout: float = 0.1
     target_modules: List[str] = field(default_factory=lambda: ["query", "value"])
     init_bound: float = 0.0  # Initialization bound for theta parameters
-    isometric: bool = True  # Use isometric initialization
+    isometric: bool = True  # Exact for partition; expected/approximate for Fastfood
+    projection_type: Literal["partition", "fastfood"] = "partition"
+    proj_seed: Optional[int] = None  # None follows the run seed
+    partition_scope: Literal["global", "transformer_block"] = "global"
     grouping_strategy: Literal["random", "signed_magnitude"] = "random"
     assignment_backend: Literal["legacy_streaming", "implicit_stateless_v1"] = (
         "implicit_stateless_v1"
@@ -37,6 +40,8 @@ GPART_BASE_CONFIG = GPARTConfig(
     target_modules=["query", "value"],
     init_bound=0.0,
     isometric=True,
+    projection_type="partition",
+    proj_seed=None,
     grouping_strategy="random",
     bias="none",
 )
@@ -47,6 +52,8 @@ GPART_LARGE_CONFIG = GPARTConfig(
     target_modules=["query", "value"],
     init_bound=0.0,
     isometric=True,
+    projection_type="partition",
+    proj_seed=None,
     grouping_strategy="random",
     bias="none",
 )
