@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import warnings
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -25,6 +26,10 @@ from peft.utils import TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING
 
 from .._buffer_dict import BufferDict
 from .config import GPartConfig
+from .fastfood import (
+    generate_fastfood_directional_gains,
+    generate_fastfood_state,
+)
 from .grouping import (
     generate_implicit_group_ids,
     generate_random_assignment,
@@ -33,16 +38,26 @@ from .grouping import (
 from .layer import GPartLayer, Linear
 
 
+@dataclass
+class _GPartBlockManifest:
+    block_id: str
+    block_ordinal: int
+    theta_start: int
+    theta_end: int
+    d_block: int
+    total_params: int
+    proj_seed: int
+    layers: list[GPartLayer]
+
+
 class GPartModel(BaseTuner):
     """
     Creates GPart model from a pretrained transformers model.
 
-    GPart (Global Partition Fine-Tuning) works by:
-    1. Flattening all N trainable model parameters into a single vector.
-    2. Randomly assigning each parameter to one of d groups using a seeded RNG.
-    3. Learning a single vector theta_d ∈ R^d (one scalar per group).
-    4. At each forward pass, adding a delta to each parameter.
-    5. Only theta_d has requires_grad=True; all base model parameters are frozen.
+    GPart learns one shared intrinsic vector and projects it into the flattened
+    adapted parameter space. The default ``partition`` projection retains the
+    original sparse normalized grouping; ``fastfood`` supplies the structured
+    dense random-projection baseline used for intrinsic-dimension comparisons.
     """
 
     prefix: str = "gpart_"
@@ -55,7 +70,33 @@ class GPartModel(BaseTuner):
         super().__init__(
             model, config, adapter_name, low_cpu_mem_usage=low_cpu_mem_usage
         )
-        self._assign_global_indices_and_scales(config[adapter_name], adapter_name)
+
+    def inject_adapter(
+        self,
+        model: nn.Module,
+        adapter_name: str,
+        autocast_adapter_dtype: bool = True,
+        low_cpu_mem_usage: bool = False,
+        state_dict: dict[str, torch.Tensor] | None = None,
+    ) -> None:
+        # BaseTuner invokes _pre_injection_hook only during construction, not
+        # when PeftModel.add_adapter calls inject_adapter later.
+        if not hasattr(self, "gpart_theta_d") or adapter_name not in self.gpart_theta_d:
+            self._pre_injection_hook(model, self.peft_config[adapter_name], adapter_name)
+        super().inject_adapter(
+            model,
+            adapter_name,
+            autocast_adapter_dtype=autocast_adapter_dtype,
+            low_cpu_mem_usage=low_cpu_mem_usage,
+            state_dict=state_dict,
+        )
+        config = self.peft_config[adapter_name]
+        if config.partition_scope == "transformer_block":
+            self._assign_transformer_block_indices_and_scales(
+                config, adapter_name
+            )
+        else:
+            self._assign_global_indices_and_scales(config, adapter_name)
         self._initialized_adapters.add(adapter_name)
 
     def _pre_injection_hook(
@@ -65,27 +106,55 @@ class GPartModel(BaseTuner):
             self.gpart_theta_d = nn.ParameterDict({})
         if not hasattr(self, "gpart_global_scales"):
             self.gpart_global_scales = BufferDict({}, persistent=False)
+        if not hasattr(self, "gpart_fastfood_signs"):
+            self.gpart_fastfood_signs = BufferDict({}, persistent=False)
+        if not hasattr(self, "gpart_fastfood_gaussian"):
+            self.gpart_fastfood_gaussian = BufferDict({}, persistent=False)
+        if not hasattr(self, "gpart_fastfood_permutation"):
+            self.gpart_fastfood_permutation = BufferDict({}, persistent=False)
         if not hasattr(self, "_initialized_adapters"):
             self._initialized_adapters: set[str] = set()
         if not hasattr(self, "_gpart_param_offset"):
             self._gpart_param_offset: dict[str, int] = {}
         if not hasattr(self, "_gpart_layers"):
             self._gpart_layers: dict[str, list[GPartLayer]] = {}
-        if not hasattr(self, "_constructor_adapter_name"):
-            self._constructor_adapter_name = adapter_name
-
+        if not hasattr(self, "_gpart_block_param_offsets"):
+            self._gpart_block_param_offsets: dict[str, dict[str, int]] = {}
+        if not hasattr(self, "_gpart_block_manifests"):
+            self._gpart_block_manifests: dict[
+                str, list[_GPartBlockManifest]
+            ] = {}
         if adapter_name not in self.gpart_theta_d:
             self._init_gpart_theta_d(config, adapter_name)
         self._gpart_layers.setdefault(adapter_name, [])
         self._gpart_param_offset.setdefault(adapter_name, 0)
+        self._gpart_block_param_offsets.setdefault(adapter_name, {})
+        self._gpart_block_manifests.setdefault(adapter_name, [])
 
-    def _post_injection_hook(
-        self, model: nn.Module, config: GPartConfig, adapter_name: str
-    ) -> None:
-        if adapter_name == self._constructor_adapter_name:
-            return
-        self._assign_global_indices_and_scales(config[adapter_name], adapter_name)
-        self._initialized_adapters.add(adapter_name)
+    @staticmethod
+    def _natural_path_key(path: str) -> tuple[tuple[int, int | str], ...]:
+        return tuple(
+            (0, int(component)) if component.isdigit() else (1, component)
+            for component in path.split(".")
+        )
+
+    @staticmethod
+    def _resolve_transformer_block_id(
+        current_key: str,
+        layers_pattern,
+    ) -> str | None:
+        if layers_pattern is None:
+            containers = {"layers", "layer", "h", "block", "blocks"}
+        elif isinstance(layers_pattern, str):
+            containers = {layers_pattern}
+        else:
+            containers = set(layers_pattern)
+
+        components = current_key.split(".")
+        for index, component in enumerate(components[:-1]):
+            if component in containers and components[index + 1].isdigit():
+                return ".".join(components[: index + 2])
+        return None
 
     def _create_and_replace(
         self,
@@ -101,6 +170,20 @@ class GPartModel(BaseTuner):
 
         self._gpart_param_offset.setdefault(adapter_name, 0)
         self._gpart_layers.setdefault(adapter_name, [])
+        self._gpart_block_param_offsets.setdefault(adapter_name, {})
+
+        block_id = None
+        if gpart_config.partition_scope == "transformer_block":
+            block_id = self._resolve_transformer_block_id(
+                current_key,
+                gpart_config.layers_pattern,
+            )
+            if block_id is None:
+                raise ValueError(
+                    "Could not resolve a numbered transformer block for targeted "
+                    f"GPart module {current_key!r}. Narrow target_modules or set "
+                    "layers_pattern to the transformer block container name."
+                )
 
         bias = hasattr(target, "bias") and target.bias is not None
         kwargs = {
@@ -113,11 +196,16 @@ class GPartModel(BaseTuner):
                 adapter_name=adapter_name,
                 gpart_theta_d=self.gpart_theta_d,
                 gpart_global_scales=self.gpart_global_scales,
+                gpart_fastfood_signs=self.gpart_fastfood_signs,
+                gpart_fastfood_gaussian=self.gpart_fastfood_gaussian,
+                gpart_fastfood_permutation=self.gpart_fastfood_permutation,
                 d=gpart_config.d,
                 gpart_dropout=gpart_config.gpart_dropout,
                 bias_config=gpart_config.bias,
                 assignment_backend=gpart_config.assignment_backend,
                 proj_seed=gpart_config.proj_seed,
+                projection_type=gpart_config.projection_type,
+                isometric=gpart_config.isometric,
             )
             injected_layer = target
         else:
@@ -125,6 +213,9 @@ class GPartModel(BaseTuner):
                 gpart_config=gpart_config,
                 gpart_theta_d=self.gpart_theta_d,
                 gpart_global_scales=self.gpart_global_scales,
+                gpart_fastfood_signs=self.gpart_fastfood_signs,
+                gpart_fastfood_gaussian=self.gpart_fastfood_gaussian,
+                gpart_fastfood_permutation=self.gpart_fastfood_permutation,
                 adapter_name=adapter_name,
                 target=target,
                 **kwargs,
@@ -144,17 +235,30 @@ class GPartModel(BaseTuner):
         ):
             param_count += base.bias.numel()
 
-        if not hasattr(injected_layer, "_gpart_param_offset"):
-            injected_layer._gpart_param_offset = {}
-        injected_layer._gpart_param_offset[adapter_name] = self._gpart_param_offset[
-            adapter_name
-        ]
-        self._gpart_param_offset[adapter_name] += param_count
+        if gpart_config.partition_scope == "transformer_block":
+            block_offsets = self._gpart_block_param_offsets[adapter_name]
+            local_offset = block_offsets.get(block_id, 0)
+            injected_layer._gpart_param_offset[adapter_name] = local_offset
+            injected_layer._gpart_block_id[adapter_name] = block_id
+            block_offsets[block_id] = local_offset + param_count
+        else:
+            injected_layer._gpart_param_offset[adapter_name] = self._gpart_param_offset[
+                adapter_name
+            ]
+            self._gpart_param_offset[adapter_name] += param_count
         self._gpart_layers.setdefault(adapter_name, []).append(injected_layer)
 
     @staticmethod
     def _create_new_module(
-        gpart_config, gpart_theta_d, gpart_global_scales, adapter_name, target, **kwargs
+        gpart_config,
+        gpart_theta_d,
+        gpart_global_scales,
+        gpart_fastfood_signs,
+        gpart_fastfood_gaussian,
+        gpart_fastfood_permutation,
+        adapter_name,
+        target,
+        **kwargs,
     ):
         if isinstance(target, BaseTunerLayer):
             target_base_layer = target.get_base_layer()
@@ -187,12 +291,17 @@ class GPartModel(BaseTuner):
             base_layer=target,
             gpart_theta_d=gpart_theta_d,
             gpart_global_scales=gpart_global_scales,
+            gpart_fastfood_signs=gpart_fastfood_signs,
+            gpart_fastfood_gaussian=gpart_fastfood_gaussian,
+            gpart_fastfood_permutation=gpart_fastfood_permutation,
             adapter_name=adapter_name,
             d=gpart_config.d,
             gpart_dropout=gpart_config.gpart_dropout,
             bias_config=gpart_config.bias,
             assignment_backend=gpart_config.assignment_backend,
             proj_seed=gpart_config.proj_seed,
+            projection_type=gpart_config.projection_type,
+            isometric=gpart_config.isometric,
             **kwargs,
         )
 
@@ -231,6 +340,7 @@ class GPartModel(BaseTuner):
         proj_seed = gpart_config.proj_seed
         isometric = gpart_config.isometric
         strategy = gpart_config.grouping_strategy
+        projection_type = gpart_config.projection_type
         include_bias = gpart_config.bias != "none"
         assignment_backend = gpart_config.assignment_backend
 
@@ -251,6 +361,46 @@ class GPartModel(BaseTuner):
             )
             for layer in gpart_layers
         )
+        if projection_type == "fastfood" and d > total_params:
+            raise ValueError(
+                f"Fastfood intrinsic dimension d={d} exceeds the adapted "
+                f"dimension D={total_params}"
+            )
+        for layer in gpart_layers:
+            layer._gpart_total_params[adapter_name] = total_params
+
+        if projection_type == "fastfood":
+            signs, gaussian, permutation = generate_fastfood_state(
+                total_params=total_params,
+                d=d,
+                proj_seed=proj_seed,
+            )
+            target_device = self.gpart_theta_d[adapter_name].device
+            self.gpart_fastfood_signs[adapter_name] = signs.to(target_device)
+            self.gpart_fastfood_gaussian[adapter_name] = gaussian.to(target_device)
+            self.gpart_fastfood_permutation[adapter_name] = permutation.to(target_device)
+            if isometric:
+                directional_gains = torch.ones(1, dtype=torch.float32)
+            else:
+                directional_gains = generate_fastfood_directional_gains(
+                    d=d,
+                    proj_seed=proj_seed,
+                )
+            self.gpart_global_scales[adapter_name] = directional_gains.to(
+                target_device
+            )
+            for layer in gpart_layers:
+                if adapter_name in layer.gpart_indices:
+                    del layer.gpart_indices[adapter_name]
+            return
+
+        for state in (
+            self.gpart_fastfood_signs,
+            self.gpart_fastfood_gaussian,
+            self.gpart_fastfood_permutation,
+        ):
+            if adapter_name in state:
+                del state[adapter_name]
 
         if strategy == "random":
             if assignment_backend == "implicit_stateless_v1":
@@ -309,6 +459,133 @@ class GPartModel(BaseTuner):
 
         target_device = self.gpart_theta_d[adapter_name].device
         self.gpart_global_scales[adapter_name] = scales.to(target_device)
+
+    def _assign_transformer_block_indices_and_scales(
+        self,
+        gpart_config: GPartConfig,
+        adapter_name: str,
+    ) -> None:
+        include_bias = gpart_config.bias != "none"
+        grouped_layers: dict[str, list[GPartLayer]] = {}
+        for layer in self._gpart_layers.get(adapter_name, []):
+            block_id = layer._gpart_block_id[adapter_name]
+            grouped_layers.setdefault(block_id, []).append(layer)
+
+        if not grouped_layers:
+            return
+
+        block_ids = sorted(grouped_layers, key=self._natural_path_key)
+        block_count = len(block_ids)
+        if gpart_config.d < block_count:
+            raise ValueError(
+                "Transformer-block GPart requires at least one coordinate per "
+                f"active block, but d={gpart_config.d} and blocks={block_count}"
+            )
+
+        base_width, remainder = divmod(gpart_config.d, block_count)
+        widths = [
+            base_width + (1 if ordinal < remainder else 0)
+            for ordinal in range(block_count)
+        ]
+        scales = torch.empty(gpart_config.d, dtype=torch.float32)
+        manifests: list[_GPartBlockManifest] = []
+        theta_start = 0
+
+        for ordinal, (block_id, d_block) in enumerate(zip(block_ids, widths)):
+            layers = grouped_layers[block_id]
+            layers.sort(key=lambda layer: layer._gpart_param_offset[adapter_name])
+            total_params = sum(
+                layer.get_base_layer().weight.numel()
+                + (
+                    layer.get_base_layer().bias.numel()
+                    if include_bias
+                    and getattr(layer.get_base_layer(), "bias", None) is not None
+                    else 0
+                )
+                for layer in layers
+            )
+            if d_block > total_params:
+                raise ValueError(
+                    "Invalid transformer-block GPart allocation: "
+                    f"d={gpart_config.d}, blocks={block_count}, block={block_id!r}, "
+                    f"allocated_width={d_block}, adapted_dimension={total_params}"
+                )
+
+            theta_end = theta_start + d_block
+            block_seed = gpart_config.proj_seed + ordinal
+            for layer in layers:
+                layer._gpart_theta_start[adapter_name] = theta_start
+                layer._gpart_theta_end[adapter_name] = theta_end
+                layer._gpart_d[adapter_name] = d_block
+                layer._gpart_proj_seed[adapter_name] = block_seed
+                layer._gpart_total_params[adapter_name] = total_params
+
+            if gpart_config.grouping_strategy == "random":
+                if gpart_config.assignment_backend == "implicit_stateless_v1":
+                    group_counts = self._count_implicit_groups_streaming(
+                        gpart_layers=layers,
+                        adapter_name=adapter_name,
+                        d=d_block,
+                        proj_seed=block_seed,
+                        include_bias=include_bias,
+                    )
+                else:
+                    group_counts = self._assign_random_indices_streaming(
+                        gpart_layers=layers,
+                        adapter_name=adapter_name,
+                        d=d_block,
+                        proj_seed=block_seed,
+                        include_bias=include_bias,
+                    )
+            else:
+                params_values = self._collect_param_values(
+                    layers,
+                    include_bias=include_bias,
+                )
+                all_indices = self.generate_assignments(
+                    total_params=total_params,
+                    d=d_block,
+                    proj_seed=block_seed,
+                    strategy=gpart_config.grouping_strategy,
+                    params_values=params_values,
+                )
+                for layer in layers:
+                    base = layer.get_base_layer()
+                    layer_params = base.weight.numel() + (
+                        base.bias.numel()
+                        if include_bias and getattr(base, "bias", None) is not None
+                        else 0
+                    )
+                    offset = layer._gpart_param_offset[adapter_name]
+                    layer.gpart_indices[adapter_name] = all_indices[
+                        offset : offset + layer_params
+                    ].clone().to(base.weight.device)
+                group_counts = torch.bincount(all_indices, minlength=d_block)
+
+            group_counts = group_counts.clamp_min(1)
+            block_scales = (
+                group_counts.float().rsqrt()
+                if gpart_config.isometric
+                else torch.ones(d_block, dtype=torch.float32)
+            )
+            scales[theta_start:theta_end] = block_scales
+            manifests.append(
+                _GPartBlockManifest(
+                    block_id=block_id,
+                    block_ordinal=ordinal,
+                    theta_start=theta_start,
+                    theta_end=theta_end,
+                    d_block=d_block,
+                    total_params=total_params,
+                    proj_seed=block_seed,
+                    layers=layers,
+                )
+            )
+            theta_start = theta_end
+
+        target_device = self.gpart_theta_d[adapter_name].device
+        self.gpart_global_scales[adapter_name] = scales.to(target_device)
+        self._gpart_block_manifests[adapter_name] = manifests
 
     def _count_implicit_groups_streaming(
         self,
@@ -399,22 +676,105 @@ class GPartModel(BaseTuner):
                 parts.append(base.bias.detach().reshape(-1).float().cpu())
         return torch.cat(parts, dim=0)
 
-    def get_nb_savable_parameters(self, adapter: str = "default") -> tuple[int, int]:
-        theta_d_params = sum(
-            param.numel()
-            for name, param in self.named_parameters()
-            if "gpart_theta_d" in name
-        )
-        buffer_count = sum(
-            buf.numel()
-            for name, buf in self.named_buffers()
-            if "gpart_indices" in name or "gpart_global_scales" in name
-        )
-        return theta_d_params, buffer_count
+    def _apply(self, fn, recurse: bool = True):
+        result = super()._apply(fn, recurse=recurse)
+        # Fixed Gaussian factors are deliberately retained in FP32 even when
+        # the trainable model is cast to a mixed-precision dtype.
+        if hasattr(self, "gpart_fastfood_gaussian"):
+            for adapter_name in list(self.gpart_fastfood_gaussian.keys()):
+                gaussian = self.gpart_fastfood_gaussian[adapter_name]
+                if gaussian.dtype != torch.float32:
+                    self.gpart_fastfood_gaussian[adapter_name] = gaussian.float()
+        return result
 
-    def print_savable_parameters(self) -> None:
-        gpart_params, buffer_count = self.get_nb_savable_parameters()
+    def delete_adapter(self, adapter_name: str) -> None:
+        super().delete_adapter(adapter_name)
+        for state in (
+            self.gpart_theta_d,
+            self.gpart_global_scales,
+            self.gpart_fastfood_signs,
+            self.gpart_fastfood_gaussian,
+            self.gpart_fastfood_permutation,
+        ):
+            if adapter_name in state:
+                del state[adapter_name]
+        self._gpart_layers.pop(adapter_name, None)
+        self._gpart_param_offset.pop(adapter_name, None)
+        self._gpart_block_param_offsets.pop(adapter_name, None)
+        self._gpart_block_manifests.pop(adapter_name, None)
+        self._initialized_adapters.discard(adapter_name)
+
+    def get_nb_savable_parameters(self, adapter: str = "default") -> tuple[int, int]:
+        theta_d_params = (
+            self.gpart_theta_d[adapter].numel()
+            if adapter in self.gpart_theta_d
+            else 0
+        )
+        runtime_buffer_count = sum(
+            state[adapter].numel()
+            for state in (
+                self.gpart_global_scales,
+                self.gpart_fastfood_signs,
+                self.gpart_fastfood_gaussian,
+                self.gpart_fastfood_permutation,
+            )
+            if adapter in state
+        )
+        runtime_buffer_count += sum(
+            layer.gpart_indices[adapter].numel()
+            for layer in self._gpart_layers.get(adapter, [])
+            if adapter in layer.gpart_indices
+        )
+        return theta_d_params, runtime_buffer_count
+
+    def get_fixed_runtime_state_bytes(self, adapter: str = "default") -> int:
+        buffer_bytes = sum(
+            state[adapter].numel() * state[adapter].element_size()
+            for state in (
+                self.gpart_global_scales,
+                self.gpart_fastfood_signs,
+                self.gpart_fastfood_gaussian,
+                self.gpart_fastfood_permutation,
+            )
+            if adapter in state
+        )
+        buffer_bytes += sum(
+            layer.gpart_indices[adapter].numel()
+            * layer.gpart_indices[adapter].element_size()
+            for layer in self._gpart_layers.get(adapter, [])
+            if adapter in layer.gpart_indices
+        )
+        return buffer_bytes
+
+    def get_runtime_adapter_bytes(self, adapter: str = "default") -> int:
+        parameter_bytes = (
+            self.gpart_theta_d[adapter].numel()
+            * self.gpart_theta_d[adapter].element_size()
+            if adapter in self.gpart_theta_d
+            else 0
+        )
+        buffer_bytes = sum(
+            state[adapter].numel() * state[adapter].element_size()
+            for state in (
+                self.gpart_global_scales,
+                self.gpart_fastfood_signs,
+                self.gpart_fastfood_gaussian,
+                self.gpart_fastfood_permutation,
+            )
+            if adapter in state
+        )
+        buffer_bytes += sum(
+            layer.gpart_indices[adapter].numel()
+            * layer.gpart_indices[adapter].element_size()
+            for layer in self._gpart_layers.get(adapter, [])
+            if adapter in layer.gpart_indices
+        )
+        return parameter_bytes + buffer_bytes
+
+    def print_savable_parameters(self, adapter: str = "default") -> None:
+        gpart_params, _ = self.get_nb_savable_parameters(adapter)
+        runtime_bytes = self.get_runtime_adapter_bytes(adapter)
         print(
-            f"GPart params to-be-saved (float32-equivalent): {gpart_params:,d} "
-            f"|| total runtime adapter footprint: {(gpart_params + buffer_count):,d}"
+            f"GPart params to be saved: {gpart_params:,d} "
+            f"|| runtime adapter footprint: {runtime_bytes:,d} bytes"
         )

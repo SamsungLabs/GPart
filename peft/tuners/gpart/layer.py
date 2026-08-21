@@ -25,6 +25,7 @@ from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 from peft.utils.other import transpose
 
 from .._buffer_dict import BufferDict
+from .fastfood import fastfood_project_slice, fastfood_project_transpose_slice
 from .grouping import generate_implicit_group_ids
 
 
@@ -206,6 +207,173 @@ class _ImplicitGPartLinearFunction(torch.autograd.Function):
         )
 
 
+class _FastfoodGPartLinearFunction(torch.autograd.Function):
+    """Layer-streamed Fastfood contribution with transform recomputation."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        theta: torch.Tensor,
+        signs: torch.Tensor,
+        gaussian: torch.Tensor,
+        permutation: torch.Tensor,
+        directional_gains: torch.Tensor,
+        total_params: int,
+        start_offset: int,
+        weight_rows: int,
+        weight_cols: int,
+        bias_numel: int,
+        isometric: bool,
+        fan_in_fan_out: bool,
+        dropout_p: float,
+        training: bool,
+    ) -> torch.Tensor:
+        total_params = int(total_params)
+        start_offset = int(start_offset)
+        weight_rows = int(weight_rows)
+        weight_cols = int(weight_cols)
+        bias_numel = int(bias_numel)
+        isometric = bool(isometric)
+        fan_in_fan_out = bool(fan_in_fan_out)
+        dropout_p = float(dropout_p)
+        training = bool(training)
+
+        weight_numel = weight_rows * weight_cols
+        delta_flat = fastfood_project_slice(
+            theta,
+            signs,
+            gaussian,
+            permutation,
+            directional_gains=directional_gains,
+            total_params=total_params,
+            start_offset=start_offset,
+            numel=weight_numel + bias_numel,
+            isometric=isometric,
+        )
+        delta_weight = delta_flat[:weight_numel].view(weight_rows, weight_cols)
+
+        dropout_rng_state = None
+        if training and dropout_p > 0.0:
+            dropout_rng_state = _capture_dropout_rng_state(x.device)
+            delta_weight = delta_weight * _dropout_mask_like(delta_weight, dropout_p)
+
+        linear_weight = delta_weight.transpose(0, 1) if fan_in_fan_out else delta_weight
+        delta_bias = None
+        if bias_numel:
+            delta_bias = delta_flat[weight_numel:].view(bias_numel)
+        result = F.linear(x, linear_weight, delta_bias)
+
+        ctx.save_for_backward(x, theta)
+        # Fixed projection factors already live in non-persistent model
+        # buffers. Keep references without registering them as saved autograd
+        # tensors, which avoids treating the full global state as per-layer
+        # activation storage.
+        ctx.signs = signs
+        ctx.gaussian = gaussian
+        ctx.permutation = permutation
+        ctx.directional_gains = directional_gains
+        ctx.total_params = total_params
+        ctx.start_offset = start_offset
+        ctx.weight_rows = weight_rows
+        ctx.weight_cols = weight_cols
+        ctx.bias_numel = bias_numel
+        ctx.isometric = isometric
+        ctx.fan_in_fan_out = fan_in_fan_out
+        ctx.dropout_p = dropout_p
+        ctx.training = training
+        ctx.dropout_rng_state = dropout_rng_state
+        return result
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output: torch.Tensor):
+        x, theta = ctx.saved_tensors
+        weight_numel = ctx.weight_rows * ctx.weight_cols
+        delta_flat = fastfood_project_slice(
+            theta,
+            ctx.signs,
+            ctx.gaussian,
+            ctx.permutation,
+            directional_gains=ctx.directional_gains,
+            total_params=ctx.total_params,
+            start_offset=ctx.start_offset,
+            numel=weight_numel + ctx.bias_numel,
+            isometric=ctx.isometric,
+        )
+        delta_weight = delta_flat[:weight_numel].view(
+            ctx.weight_rows,
+            ctx.weight_cols,
+        )
+
+        dropout_mask = None
+        if ctx.training and ctx.dropout_p > 0.0:
+            dropout_mask = _dropout_mask_like(
+                delta_weight,
+                ctx.dropout_p,
+                ctx.dropout_rng_state,
+            )
+            delta_weight = delta_weight * dropout_mask
+
+        linear_weight = (
+            delta_weight.transpose(0, 1)
+            if ctx.fan_in_fan_out
+            else delta_weight
+        )
+        out_features, in_features = linear_weight.shape
+        grad_output_2d = grad_output.reshape(-1, out_features).to(linear_weight.dtype)
+
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            grad_x = grad_output_2d.matmul(linear_weight).view_as(x)
+
+        grad_theta = None
+        if ctx.needs_input_grad[1]:
+            x_2d = x.reshape(-1, in_features)
+            grad_linear_weight = grad_output_2d.transpose(0, 1).matmul(x_2d)
+            grad_weight = (
+                grad_linear_weight.transpose(0, 1)
+                if ctx.fan_in_fan_out
+                else grad_linear_weight
+            )
+            if dropout_mask is not None:
+                grad_weight = grad_weight * dropout_mask
+
+            grad_parts = [grad_weight.reshape(-1)]
+            if ctx.bias_numel:
+                grad_parts.append(grad_output_2d.sum(dim=0))
+            grad_delta_flat = torch.cat(grad_parts)
+            grad_theta = fastfood_project_transpose_slice(
+                grad_delta_flat,
+                ctx.signs,
+                ctx.gaussian,
+                ctx.permutation,
+                directional_gains=ctx.directional_gains,
+                theta_numel=theta.numel(),
+                total_params=ctx.total_params,
+                start_offset=ctx.start_offset,
+                isometric=ctx.isometric,
+            )
+
+        return (
+            grad_x,
+            grad_theta,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 class GPartLayer(BaseTunerLayer):
     adapter_layer_names = ()
     other_param_names = (
@@ -213,9 +381,15 @@ class GPartLayer(BaseTunerLayer):
         "gpart_dropout",
         "_gpart_update_bias",
         "_gpart_assignment_backend",
+        "_gpart_projection_type",
+        "_gpart_isometric",
+        "_gpart_total_params",
         "_gpart_d",
         "_gpart_proj_seed",
         "_gpart_param_offset",
+        "_gpart_block_id",
+        "_gpart_theta_start",
+        "_gpart_theta_end",
     )
 
     def __init__(self, base_layer: nn.Module, **kwargs):
@@ -225,9 +399,15 @@ class GPartLayer(BaseTunerLayer):
         self.gpart_indices = BufferDict({}, persistent=False)
         self._gpart_update_bias: dict[str, bool] = {}
         self._gpart_assignment_backend: dict[str, str] = {}
+        self._gpart_projection_type: dict[str, str] = {}
+        self._gpart_isometric: dict[str, bool] = {}
+        self._gpart_total_params: dict[str, int] = {}
         self._gpart_d: dict[str, int] = {}
         self._gpart_proj_seed: dict[str, int] = {}
         self._gpart_param_offset: dict[str, int] = {}
+        self._gpart_block_id: dict[str, str] = {}
+        self._gpart_theta_start: dict[str, int] = {}
+        self._gpart_theta_end: dict[str, int] = {}
 
         self._disable_adapters = False
         self.merged_adapters = []
@@ -257,11 +437,16 @@ class GPartLayer(BaseTunerLayer):
         adapter_name: str,
         gpart_theta_d,
         gpart_global_scales,
+        gpart_fastfood_signs,
+        gpart_fastfood_gaussian,
+        gpart_fastfood_permutation,
         d: int,
         gpart_dropout: float = 0.0,
         bias_config: str = "none",
         assignment_backend: str = "legacy_streaming",
         proj_seed: int = 42,
+        projection_type: str = "partition",
+        isometric: bool = True,
     ):
         if d <= 0:
             raise ValueError(f"`d` {d} should be a positive integer value")
@@ -273,11 +458,20 @@ class GPartLayer(BaseTunerLayer):
 
         object.__setattr__(self, "_gpart_theta_d_ref", gpart_theta_d)
         object.__setattr__(self, "_gpart_global_scales_ref", gpart_global_scales)
+        object.__setattr__(self, "_gpart_fastfood_signs_ref", gpart_fastfood_signs)
+        object.__setattr__(self, "_gpart_fastfood_gaussian_ref", gpart_fastfood_gaussian)
+        object.__setattr__(
+            self, "_gpart_fastfood_permutation_ref", gpart_fastfood_permutation
+        )
 
         self._gpart_update_bias[adapter_name] = bias_config != "none"
         self._gpart_assignment_backend[adapter_name] = assignment_backend
+        self._gpart_projection_type[adapter_name] = projection_type
+        self._gpart_isometric[adapter_name] = bool(isometric)
         self._gpart_d[adapter_name] = d
         self._gpart_proj_seed[adapter_name] = int(proj_seed)
+        self._gpart_theta_start[adapter_name] = 0
+        self._gpart_theta_end[adapter_name] = d
 
         self._move_adapter_to_device_of_base_layer(adapter_name)
         self.set_adapter(self.active_adapters)
@@ -291,6 +485,9 @@ class Linear(nn.Linear, GPartLayer):
         base_layer,
         gpart_theta_d,
         gpart_global_scales,
+        gpart_fastfood_signs,
+        gpart_fastfood_gaussian,
+        gpart_fastfood_permutation,
         adapter_name: str,
         d: int,
         gpart_dropout: float = 0.0,
@@ -299,6 +496,8 @@ class Linear(nn.Linear, GPartLayer):
         bias_config: str = "none",
         assignment_backend: str = "legacy_streaming",
         proj_seed: int = 42,
+        projection_type: str = "partition",
+        isometric: bool = True,
         **kwargs,
     ) -> None:
         super(nn.Linear, self).__init__()
@@ -309,11 +508,16 @@ class Linear(nn.Linear, GPartLayer):
             adapter_name,
             gpart_theta_d,
             gpart_global_scales,
+            gpart_fastfood_signs,
+            gpart_fastfood_gaussian,
+            gpart_fastfood_permutation,
             d,
             gpart_dropout,
             bias_config=bias_config,
             assignment_backend=assignment_backend,
             proj_seed=proj_seed,
+            projection_type=projection_type,
+            isometric=isometric,
         )
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
 
@@ -340,22 +544,54 @@ class Linear(nn.Linear, GPartLayer):
         indices = self.gpart_indices[adapter]
         return indices if indices.device == device else indices.to(device)
 
-    def _compute_delta_flat(self, adapter: str, cast_to_fp32: bool) -> torch.Tensor:
-        theta_d = self._gpart_theta_d_ref[adapter]
-        device = theta_d.device
-        indices = self._get_group_ids(adapter, device)
+    def _get_theta_and_scales(
+        self,
+        adapter: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        start = self._gpart_theta_start[adapter]
+        end = self._gpart_theta_end[adapter]
+        theta = self._gpart_theta_d_ref[adapter][start:end]
         scales = self._gpart_global_scales_ref[adapter]
+        if self._gpart_projection_type[adapter] == "partition":
+            scales = scales[start:end]
+        return theta, scales
+
+    def _compute_delta_flat(self, adapter: str, cast_to_fp32: bool) -> torch.Tensor:
+        theta_d, scales = self._get_theta_and_scales(adapter)
+        device = theta_d.device
+        if cast_to_fp32:
+            theta_d = theta_d.float()
+
+        base = self.get_base_layer()
+        bias_numel = (
+            base.bias.numel()
+            if self._gpart_update_bias.get(adapter, False) and base.bias is not None
+            else 0
+        )
+        if self._gpart_projection_type[adapter] == "fastfood":
+            return fastfood_project_slice(
+                theta_d,
+                self._gpart_fastfood_signs_ref[adapter],
+                self._gpart_fastfood_gaussian_ref[adapter],
+                self._gpart_fastfood_permutation_ref[adapter],
+                directional_gains=self._gpart_global_scales_ref[adapter],
+                total_params=self._gpart_total_params[adapter],
+                start_offset=self._gpart_param_offset[adapter],
+                numel=base.weight.numel() + bias_numel,
+                isometric=self._gpart_isometric[adapter],
+            )
+
+        indices = self._get_group_ids(adapter, device)
         if scales.device != device:
             scales = scales.to(device)
 
         if cast_to_fp32:
-            theta_d = theta_d.float()
             scales = scales.float()
 
         return (theta_d * scales)[indices]
 
     def get_delta_weight(self, adapter: str) -> torch.Tensor:
-        theta_d = self._gpart_theta_d_ref[adapter]
+        theta_d, _ = self._get_theta_and_scales(adapter)
         dtype = theta_d.dtype
         cast_to_fp32 = theta_d.device.type == "cpu" and dtype == torch.float16
 
@@ -475,11 +711,12 @@ class Linear(nn.Linear, GPartLayer):
         x_in = x.to(device=target_device, dtype=target_dtype)
 
         for active_adapter in valid_adapters:
-            theta = self._gpart_theta_d_ref[active_adapter].to(
+            theta, scales = self._get_theta_and_scales(active_adapter)
+            theta = theta.to(
                 device=target_device,
                 dtype=target_dtype,
             )
-            scales = self._gpart_global_scales_ref[active_adapter].to(
+            scales = scales.to(
                 device=target_device,
                 dtype=target_dtype,
             )
@@ -489,12 +726,30 @@ class Linear(nn.Linear, GPartLayer):
             )
             bias_numel = base.bias.numel() if update_bias else 0
 
-            if (
+            dropout = self.gpart_dropout[active_adapter]
+            dropout_p = dropout.p if isinstance(dropout, nn.Dropout) else 0.0
+            if self._gpart_projection_type[active_adapter] == "fastfood":
+                contribution = _FastfoodGPartLinearFunction.apply(
+                    x_in,
+                    theta,
+                    self._gpart_fastfood_signs_ref[active_adapter],
+                    self._gpart_fastfood_gaussian_ref[active_adapter],
+                    self._gpart_fastfood_permutation_ref[active_adapter],
+                    scales,
+                    self._gpart_total_params[active_adapter],
+                    self._gpart_param_offset[active_adapter],
+                    base.weight.shape[0],
+                    base.weight.shape[1],
+                    bias_numel,
+                    self._gpart_isometric[active_adapter],
+                    self.fan_in_fan_out,
+                    dropout_p,
+                    dropout.training,
+                )
+            elif (
                 self._gpart_assignment_backend[active_adapter]
                 == "implicit_stateless_v1"
             ):
-                dropout = self.gpart_dropout[active_adapter]
-                dropout_p = dropout.p if isinstance(dropout, nn.Dropout) else 0.0
                 contribution = _ImplicitGPartLinearFunction.apply(
                     x_in,
                     theta,

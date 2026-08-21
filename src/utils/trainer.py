@@ -43,7 +43,7 @@ RESULTS_FILENAME = "results.json"
 
 
 def get_gpart_suffixes(adapter_config: dict) -> tuple:
-    """Build isometric and grouping_strategy suffixes for GPart adapters.
+    """Build projection, isometric, and grouping suffixes for GPart adapters.
 
     Args:
         adapter_config: Adapter configuration dictionary
@@ -55,6 +55,11 @@ def get_gpart_suffixes(adapter_config: dict) -> tuple:
     if "isometric" in adapter_config and adapter_config["isometric"] == False:
         isometric_suffix = "_iso{}".format(str(adapter_config["isometric"]).lower())
 
+    projection_suffix = (
+        "_fastfood"
+        if adapter_config.get("projection_type", "partition") == "fastfood"
+        else ""
+    )
     grouping_suffix = ""
     if (
         "grouping_strategy" in adapter_config
@@ -62,7 +67,7 @@ def get_gpart_suffixes(adapter_config: dict) -> tuple:
     ):
         grouping_suffix = f"_{adapter_config['grouping_strategy']}"
 
-    return isometric_suffix, grouping_suffix
+    return isometric_suffix, projection_suffix + grouping_suffix
 
 
 def get_output_dir(
@@ -634,7 +639,7 @@ def run_task(
     log_task_config(config, logger)
 
     # Run training
-    model, _ = run_training_loop(
+    model, selection_metrics = run_training_loop(
         model,
         train_loader,
         val_loader,
@@ -649,6 +654,11 @@ def run_task(
 
     # Evaluate on test set
     test_metrics = evaluate_test(model, test_loader, config.task_name, device, logger)
+    # Keep the unrounded internal-validation score distinct from the rounded
+    # official validation metrics used as this runner's final test split.
+    test_metrics.update(
+        {f"selection_{key}": value for key, value in selection_metrics.items()}
+    )
     logger.info(f"Task {config.task_name.upper()} final test metrics: {test_metrics}")
 
     # Log to MLflow

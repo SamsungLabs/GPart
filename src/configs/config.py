@@ -176,12 +176,12 @@ def _set_training_attr(config: ExperimentConfig, key: str, value: str):
         # Try to convert to appropriate type
         if hasattr(config.training, key):
             current_value = getattr(config.training, key)
-            if isinstance(current_value, int):
+            if isinstance(current_value, bool):
+                value = value.lower() == "true"
+            elif isinstance(current_value, int):
                 value = int(value)
             elif isinstance(current_value, float):
                 value = float(value)
-            elif isinstance(current_value, bool):
-                value = value.lower() == "true"
             setattr(config.training, key, value)
     except (ValueError, AttributeError):
         pass  # Ignore invalid overrides
@@ -193,12 +193,14 @@ def _set_adapter_attr(config: ExperimentConfig, key: str, value: str):
         # Try to convert to appropriate type
         if hasattr(config.adapter, key):
             current_value = getattr(config.adapter, key)
-            if isinstance(current_value, int):
+            if key == "proj_seed":
+                value = None if value.lower() == "none" else int(value)
+            elif isinstance(current_value, bool):
+                value = value.lower() == "true"
+            elif isinstance(current_value, int):
                 value = int(value)
             elif isinstance(current_value, float):
                 value = float(value)
-            elif isinstance(current_value, bool):
-                value = value.lower() == "true"
             setattr(config.adapter, key, value)
     except (ValueError, AttributeError):
         pass  # Ignore invalid overrides
